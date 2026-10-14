@@ -8,10 +8,14 @@ create table if not exists public.events (
     starts_at timestamptz not null,
     venue text not null check (char_length(venue) between 1 and 200),
     capacity integer not null check (capacity > 0),
+    registration_fields jsonb not null default '[]'::jsonb
+        check (jsonb_typeof(registration_fields) = 'array'),
     published boolean not null default false,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
+alter table public.events
+    add column if not exists registration_fields jsonb not null default '[]'::jsonb;
 
 create or replace function public.set_event_updated_at()
 returns trigger
@@ -37,9 +41,13 @@ create table if not exists public.registrations (
     student_id text not null check (char_length(student_id) between 2 and 50),
     email text not null check (char_length(email) between 3 and 254),
     phone text,
+    form_answers jsonb not null default '{}'::jsonb
+        check (jsonb_typeof(form_answers) = 'object'),
     created_at timestamptz not null default now(),
     constraint unique_event_student unique (event_id, student_id)
 );
+alter table public.registrations
+    add column if not exists form_answers jsonb not null default '{}'::jsonb;
 alter table public.registrations
     add column if not exists user_id uuid references auth.users(id) on delete cascade;
 create unique index if not exists unique_event_user

@@ -6,11 +6,19 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import streamlit as st
+import pandas as pd
 from supabase import Client, create_client
 from streamlit.errors import StreamlitSecretNotFoundError
 
 from event_app.admin_auth import admin_configuration_error, authenticate_admin
+from event_app.backend_errors import backend_error_message
 from event_app.exports import registrations_csv
+from event_app.registration_forms import (
+    editor_rows,
+    flatten_registration,
+    validate_registration_answers,
+    validate_registration_fields,
+)
 from event_app.student_auth import (
     clear_student_session,
     current_student,
@@ -121,10 +129,10 @@ def error_message(error: Exception) -> str:
 def event_save_error(error: Exception) -> str:
     if "capacity_below_registration_count" in str(error).lower():
         return "Capacity can't be lower than the number of students already registered."
-    return "We couldn't save the event. Please check the details and try again."
+    return f"We couldn't save the event. {backend_error_message(error)}"
 
 
-def show_event_card(event: dict[str, Any], count: int) -> None:
+def show_event_card(event: dict[str, Any], count: Optional[int]) -> None:
     with st.container(border=True):
         col_text, col_action = st.columns([4, 1])
         with col_text:
@@ -132,8 +140,11 @@ def show_event_card(event: dict[str, Any], count: int) -> None:
             st.markdown(
                 f"📅 {format_datetime(event['starts_at'])}  ·  📍 {event['venue']}"
             )
-            remaining = max(int(event["capacity"]) - count, 0)
-            st.caption(f"{remaining} of {event['capacity']} spots left")
+            if count is None:
+                st.caption("Availability temporarily unavailable")
+            else:
+                remaining = max(int(event["capacity"]) - count, 0)
+                st.caption(f"{remaining} of {event['capacity']} spots left")
         with col_action:
             if st.button("Details", key=f"details-{event['id']}", use_container_width=True):
                 st.session_state["selected_event_id"] = event["id"]
@@ -142,10 +153,13 @@ def show_event_card(event: dict[str, Any], count: int) -> None:
 def show_registration_form(
     client: Client,
     event: dict[str, Any],
-    count: int,
+    count: Optional[int],
     student_user: Optional[Any],
 ) -> None:
     capacity = int(event["capacity"])
+    if count is None:
+        st.warning("Registration availability is temporarily unavailable. Please try again shortly.")
+        return
     if count >= capacity:
         st.warning("This event is full and registration is closed.")
         return
@@ -168,15 +182,40 @@ def show_registration_form(
     if student.get("phone"):
         st.caption(f"Phone: {student['phone']}")
     st.markdown("#### Save your spot")
+    fields = event.get("registration_fields") or []
+    answers = {}
     with st.form(f"register-{event['id']}-{student_user.id}"):
+        for index, field in enumerate(fields):
+            key = f"registration-answer-{event['id']}-{student_user.id}-{index}"
+            label = field["label"] + (" *" if field.get("required") else "")
+            if field["type"] == "textarea":
+                answers[field["label"]] = st.text_area(label, max_chars=3000, key=key)
+            elif field["type"] == "select":
+                options = field.get("options", [])
+                selection = st.selectbox(
+                    label,
+                    options=[""] + options,
+                    format_func=lambda option: option or "Select an option",
+                    key=key,
+                )
+                answers[field["label"]] = selection or None
+            elif field["type"] == "checkbox":
+                answers[field["label"]] = st.checkbox(label, key=key)
+            else:
+                answers[field["label"]] = st.text_input(label, max_chars=500, key=key)
         submitted = st.form_submit_button(
             "Register for this event",
             type="primary",
             use_container_width=True,
         )
     if submitted:
+        answer_errors = validate_registration_answers(fields, answers)
+        if answer_errors:
+            for message in answer_errors:
+                st.error(message)
+            return
         try:
-            create_registration(client, event["id"], student, student_user.id)
+            create_registration(client, event["id"], student, student_user.id, answers)
             st.success("You're in! Your registration has been saved.")
             st.rerun()
         except Exception as error:
@@ -186,7 +225,7 @@ def show_registration_form(
 def show_event_detail(
     client: Client,
     event: dict[str, Any],
-    count: int,
+    count: Optional[int],
     student_user: Optional[Any],
 ) -> None:
     st.markdown("---")
@@ -209,7 +248,10 @@ def show_event_detail(
             if photos:
                 st.image([photo["public_url"] for photo in photos], use_container_width=True)
         with right:
-            st.metric("Spots remaining", max(int(event["capacity"]) - count, 0))
+            st.metric(
+                "Spots remaining",
+                "—" if count is None else max(int(event["capacity"]) - count, 0),
+            )
             show_registration_form(client, event, count, student_user)
 
 
@@ -226,10 +268,17 @@ def show_public_view(client: Client, student_user: Optional[Any]) -> None:
     )
     try:
         events = list_events(client)
-        counts = registration_counts(client)
-    except Exception:
-        st.error("We couldn't load events right now. Please refresh the page or try again later.")
+    except Exception as error:
+        st.error(f"We couldn't load events. {backend_error_message(error)}")
         return
+    try:
+        counts = registration_counts(client)
+    except Exception as error:
+        counts = {}
+        st.warning(
+            "Events are available to browse, but registration availability could not be loaded. "
+            + backend_error_message(error)
+        )
 
     upcoming = [
         event for event in events
@@ -239,14 +288,23 @@ def show_public_view(client: Client, student_user: Optional[Any]) -> None:
     if not upcoming:
         st.info("No upcoming events just yet. Check back soon!")
         return
+    availability_loaded = bool(counts) or not events
     for event in upcoming:
-        show_event_card(event, counts.get(event["id"], 0))
+        show_event_card(
+            event,
+            counts.get(event["id"], 0) if availability_loaded else None,
+        )
 
     selected_id = st.session_state.get("selected_event_id")
     if selected_id:
         event = next((item for item in upcoming if item["id"] == selected_id), None)
         if event:
-            show_event_detail(client, event, counts.get(event["id"], 0), student_user)
+            show_event_detail(
+                client,
+                event,
+                counts.get(event["id"], 0) if availability_loaded else None,
+                student_user,
+            )
 
 
 def show_student_account(auth_client: Client, student_user: Optional[Any]) -> None:
@@ -346,7 +404,11 @@ def is_admin_authenticated() -> bool:
     if configuration_error:
         st.error(f"Admin access is disabled. {configuration_error}")
         return False
-    return bool(st.session_state.get("admin_email"))
+    authenticated_email = st.session_state.get("admin_email", "")
+    return any(
+        str(configured_email).strip().lower() == authenticated_email
+        for configured_email in configured_admins
+    )
 
 
 def show_admin_login() -> bool:
@@ -381,7 +443,7 @@ def event_form(
     *,
     event: Optional[dict[str, Any]] = None,
     key: str,
-) -> tuple[bool, dict[str, Any]]:
+) -> tuple[bool, dict[str, Any], list[str]]:
     default_title = event["title"] if event else ""
     default_description = event["description"] if event else ""
     default_venue = event["venue"] if event else ""
@@ -408,21 +470,55 @@ def event_form(
         with capacity_col:
             capacity = st.number_input("Capacity", min_value=1, max_value=100000, value=default_capacity, step=1)
         published = st.checkbox("Published (visible to students)", value=default_published)
+        st.markdown("##### Student registration questions")
+        st.caption(
+            "Add optional questions students answer when registering. For Dropdown, "
+            "enter choices separated by commas."
+        )
+        question_rows = st.data_editor(
+            pd.DataFrame(
+                editor_rows(event.get("registration_fields", []) if event else []),
+                columns=[
+                    "Question",
+                    "Answer type",
+                    "Required",
+                    "Dropdown choices (comma separated)",
+                ],
+            ),
+            column_config={
+                "Question": st.column_config.TextColumn("Question", required=True),
+                "Answer type": st.column_config.SelectboxColumn(
+                    "Answer type",
+                    options=["Short answer", "Paragraph", "Dropdown", "Checkbox"],
+                    required=True,
+                ),
+                "Required": st.column_config.CheckboxColumn("Required"),
+                "Dropdown choices (comma separated)": st.column_config.TextColumn(
+                    "Dropdown choices (comma separated)",
+                    help="Only used for Dropdown questions.",
+                ),
+            },
+            num_rows="dynamic",
+            hide_index=True,
+            key=f"registration-fields-{key}",
+        )
         submitted = st.form_submit_button("Save event", type="primary")
 
+    fields, field_errors = validate_registration_fields(question_rows.to_dict("records"))
     values = {
         "title": title.strip(),
         "description": description.strip(),
         "venue": venue.strip(),
         "capacity": int(capacity),
         "published": published,
+        "registration_fields": fields or [],
         "starts_at": (
             datetime.combine(event_date, event_time)
             .replace(tzinfo=configured_timezone())
             .isoformat()
         ),
     }
-    return submitted, values
+    return submitted, values, field_errors
 
 
 def upload_event_photos(client: Client, event_id: str, files: list[Any]) -> None:
@@ -441,9 +537,12 @@ def upload_event_photos(client: Client, event_id: str, files: list[Any]) -> None
 
 def show_event_admin(client: Client, events: list[dict[str, Any]]) -> None:
     st.markdown("#### Create an event")
-    submitted, values = event_form(key="create-event")
+    submitted, values, field_errors = event_form(key="create-event")
     if submitted:
-        if not values["title"] or not values["description"] or not values["venue"]:
+        if field_errors:
+            for message in field_errors:
+                st.error(message)
+        elif not values["title"] or not values["description"] or not values["venue"]:
             st.error("Add an event title, description, and venue before saving.")
         else:
             try:
@@ -460,9 +559,15 @@ def show_event_admin(client: Client, events: list[dict[str, Any]]) -> None:
     labels = {f"{event['title']} · {event['id'][:8]}": event for event in events}
     selected_label = st.selectbox("Choose an event", options=list(labels))
     selected = labels[selected_label]
-    submitted, values = event_form(event=selected, key=f"update-event-{selected['id']}")
+    submitted, values, field_errors = event_form(
+        event=selected,
+        key=f"update-event-{selected['id']}",
+    )
     if submitted:
-        if not values["title"] or not values["description"] or not values["venue"]:
+        if field_errors:
+            for message in field_errors:
+                st.error(message)
+        elif not values["title"] or not values["description"] or not values["venue"]:
             st.error("Add an event title, description, and venue before saving.")
         else:
             try:
@@ -484,12 +589,12 @@ def show_event_admin(client: Client, events: list[dict[str, Any]]) -> None:
             upload_event_photos(client, selected["id"], uploads)
             st.success("Photos uploaded.")
             st.rerun()
-        except Exception:
-            st.error("Photo upload failed. Check Supabase Storage setup and try again.")
+        except Exception as error:
+            st.error(f"Photo upload failed. {backend_error_message(error)}")
     try:
         photos = list_photos(client, selected["id"])
-    except Exception:
-        st.error("We couldn't load this event's photos.")
+    except Exception as error:
+        st.error(f"We couldn't load this event's photos. {backend_error_message(error)}")
         photos = []
     for photo in photos:
         image_col, delete_col = st.columns([4, 1])
@@ -503,8 +608,8 @@ def show_event_admin(client: Client, events: list[dict[str, Any]]) -> None:
                     )
                     delete_photo_record(client, photo["id"])
                     st.rerun()
-                except Exception:
-                    st.error("We couldn't remove that photo. Please try again.")
+                except Exception as error:
+                    st.error(f"We couldn't remove that photo. {backend_error_message(error)}")
 
 
 def show_registration_admin(client: Client, events: list[dict[str, Any]]) -> None:
@@ -517,15 +622,17 @@ def show_registration_admin(client: Client, events: list[dict[str, Any]]) -> Non
     event = event_labels[label]
     try:
         rows = list_registrations(client, event["id"])
-    except Exception:
-        st.error("We couldn't load registrations for this event.")
+    except Exception as error:
+        st.error(f"We couldn't load registrations. {backend_error_message(error)}")
         return
     st.caption(f"{len(rows)} registered · capacity {event['capacity']}")
     if rows:
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        fields = event.get("registration_fields") or []
+        export_rows = [flatten_registration(row, fields) for row in rows]
+        st.dataframe(export_rows, use_container_width=True, hide_index=True)
         st.download_button(
             "Download registrations as CSV",
-            data=registrations_csv(rows),
+            data=registrations_csv(export_rows),
             file_name=f"registrations-{event['id'][:8]}.csv",
             mime="text/csv",
             type="primary",
@@ -538,10 +645,11 @@ def show_admin_view(client: Client) -> None:
     st.markdown("### Event administrator")
     if not show_admin_login():
         return
+    st.caption("Create and publish events, manage photos and registration forms, and review student sign-ups.")
     try:
         events = list_events(client, published_only=False)
-    except Exception:
-        st.error("We couldn't load admin data. Check your Supabase configuration.")
+    except Exception as error:
+        st.error(f"We couldn't load admin data. {backend_error_message(error)}")
         return
     event_tab, registration_tab = st.tabs(["Manage events", "Registrations"])
     with event_tab:

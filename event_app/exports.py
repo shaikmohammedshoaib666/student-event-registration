@@ -5,16 +5,26 @@ import io
 from typing import Any
 
 
-REGISTRATION_COLUMNS = ("student_name", "student_id", "email", "phone", "created_at")
+REGISTRATION_COLUMNS = (
+    "Student name",
+    "Student ID",
+    "Email",
+    "Phone",
+    "Registered at",
+)
 
 
 def registrations_csv(rows: list[dict[str, Any]]) -> bytes:
     output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=REGISTRATION_COLUMNS, extrasaction="ignore")
+    extra_columns = list(dict.fromkeys(
+        column for row in rows for column in row if column not in REGISTRATION_COLUMNS
+    ))
+    columns = [*REGISTRATION_COLUMNS, *extra_columns]
+    writer = csv.DictWriter(output, fieldnames=columns, extrasaction="ignore")
     writer.writeheader()
     for row in rows:
         safe_row = {}
-        for column in REGISTRATION_COLUMNS:
+        for column in columns:
             value = row.get(column, "")
             if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")):
                 value = f"'{value}"

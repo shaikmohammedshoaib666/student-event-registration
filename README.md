@@ -8,6 +8,7 @@ A student-friendly event discovery and registration app built with Streamlit and
 - Students create an account with Supabase Auth using their name, student ID, email, and optional phone number; event details remain browsable without signing in, but registration requires a student account.
 - Prevent duplicate registrations per event and student ID/account; database triggers serialize registrations and enforce capacity.
 - Admin-only event creation, editing, publishing/unpublishing, photo uploads/removals, and per-event CSV registration exports.
+- Admins can add up to 12 required/optional student registration questions per event (short answer, paragraph, dropdown, or checkbox); answers appear in the registration table and CSV export.
 - Server-side-only Supabase service-role access with database row-level security enabled.
 
 ## Local setup
@@ -35,7 +36,9 @@ The app's server-side secret/service-role key remains on the Streamlit server an
 
 The schema enables RLS on all application tables. Anonymous and authenticated roles can only read published event details and their public event photos; they cannot read registrations or write application data. Streamlit verifies students with Supabase Auth and performs database writes and admin reads server-side. SQL constraints and triggers enforce valid capacities, unique event/student and event/account registrations, published-event registration, and capacity even when simultaneous submissions compete for the final place.
 
-If you initialized the database using an earlier version of the schema before student accounts were added, run the updated `supabase/schema.sql` in the SQL Editor to add the account linkage and uniqueness index. The script is idempotent for these setup steps, but review migrations before applying schema changes to an existing production database. If you change the storage bucket name in Streamlit secrets, update the bucket ID and storage policy in the SQL to match.
+If you initialized the database using an earlier version of the schema, run the latest `supabase/schema.sql` in the SQL Editor to add the student account linkage, registration answers, and event question definitions. The script is idempotent for these setup steps, but review migrations before applying schema changes to an existing production database. If you change the storage bucket name in Streamlit secrets, update the bucket ID and storage policy in the SQL to match.
+
+If the event list displays a database setup error, follow its specific guidance. A missing-table/column message means the latest schema has not been applied to the same Supabase project whose URL is in Streamlit Secrets. An invalid-key/permission message means to check the project URL and server-side key; re-run the schema after confirming the project.
 
 ## Tests
 
