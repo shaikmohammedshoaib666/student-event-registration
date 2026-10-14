@@ -75,6 +75,24 @@ def list_conversations(client: Any, user_id: str, email: str) -> list[dict[str, 
     )
 
 
+def get_student_conversation(
+    client: Any,
+    conversation_id: str,
+    student_user_id: str,
+) -> Optional[dict[str, Any]]:
+    rows = (
+        client.table("event_conversations")
+        .select("*,events(title,starts_at)")
+        .eq("id", conversation_id)
+        .eq("student_user_id", student_user_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    return rows[0] if rows else None
+
+
 def list_messages(client: Any, conversation_id: str) -> list[dict[str, Any]]:
     return (
         client.table("event_messages")

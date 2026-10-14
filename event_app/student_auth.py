@@ -59,3 +59,5 @@ def current_student(auth_client: Any, session_state: Any) -> Optional[Any]:
 def clear_student_session(session_state: Any) -> None:
     session_state.pop("student_access_token", None)
     session_state.pop("student_refresh_token", None)
+    session_state.pop("account_chat_conversation_id", None)
+    session_state.pop("selected_conversation_id", None)

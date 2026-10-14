@@ -11,8 +11,14 @@ from supabase import Client, create_client
 from streamlit.errors import StreamlitSecretNotFoundError
 
 from event_app.admin_auth import admin_configuration_error, authenticate_admin
+from event_app.announcements import (
+    create_event_announcement,
+    delete_event_announcement,
+    list_event_announcements,
+)
 from event_app.backend_errors import backend_error_message
 from event_app.chat import (
+    get_student_conversation,
     get_or_create_conversation,
     list_conversations,
     list_messages,
@@ -120,6 +126,101 @@ def apply_pending_navigation() -> None:
         st.session_state["app_section"] = section
 
 
+def show_conversation_thread(
+    client: Client,
+    student_user: Any,
+    conversation: dict[str, Any],
+    *,
+    key_prefix: str,
+) -> None:
+    email = (student_user.email or "").strip().lower()
+    event = conversation.get("events") or {}
+    other_person = (
+        conversation["coordinator_email"]
+        if conversation["student_user_id"] == student_user.id
+        else (
+            f"{conversation.get('student_name') or 'Student'} · "
+            f"ID {conversation.get('student_id') or 'not provided'} "
+            f"({conversation['student_email']})"
+        )
+    )
+    st.caption(f"{event.get('title', 'Event')} · with {other_person}")
+    try:
+        messages = list_messages(client, conversation["id"])
+    except Exception as error:
+        st.error(f"Couldn't load messages. {backend_error_message(error)}")
+        return
+
+    for message in messages:
+        is_current_user = message["sender_user_id"] == student_user.id
+        with st.chat_message("user" if is_current_user else "assistant"):
+            st.caption(
+                "You" if is_current_user else message.get("sender_email", "Participant")
+            )
+            if message.get("body"):
+                st.write(message["body"])
+            if message.get("attachment_path"):
+                try:
+                    image_url = signed_chat_image_url(client, message["attachment_path"])
+                    st.image(image_url, caption="Photo attachment", width=420)
+                except Exception as error:
+                    st.warning(f"Couldn't load this photo. {backend_error_message(error)}")
+            st.caption(message["created_at"])
+
+    with st.form(
+        f"send-message-{key_prefix}-{conversation['id']}",
+        clear_on_submit=True,
+    ):
+        body = st.text_area(
+            "Message",
+            max_chars=4000,
+            height=90,
+            key=f"message-body-{key_prefix}-{conversation['id']}",
+        )
+        attachment = st.file_uploader(
+            "Attach a photo (optional, up to 5 MB)",
+            type=["png", "jpg", "jpeg", "webp"],
+            key=f"chat-photo-{key_prefix}-{conversation['id']}",
+        )
+        send = st.form_submit_button("Send message", type="primary")
+    if send:
+        cleaned_body = body.strip()
+        if not cleaned_body and attachment is None:
+            st.warning("Write a message or attach a photo before sending.")
+            return
+        if attachment is not None and attachment.size > 5 * 1024 * 1024:
+            st.error("Chat photos must be 5 MB or smaller.")
+            return
+        attachment_path = None
+        try:
+            if attachment is not None:
+                attachment_path = upload_chat_image(
+                    client,
+                    conversation["id"],
+                    student_user.id,
+                    attachment,
+                )
+            send_message(
+                client,
+                conversation["id"],
+                student_user.id,
+                email,
+                cleaned_body,
+                attachment_path=attachment_path,
+            )
+            st.rerun()
+        except Exception as error:
+            if attachment_path:
+                try:
+                    client.storage.from_("chat-attachments").remove([attachment_path])
+                except Exception as cleanup_error:
+                    st.warning(
+                        "The photo upload could not be cleaned up after the message failed. "
+                        f"{backend_error_message(cleanup_error)}"
+                    )
+            st.error(f"Couldn't send this message. {backend_error_message(error)}")
+
+
 def get_supabase_client() -> Client:
     url = secret_value("SUPABASE_URL")
     key = secret_value("SUPABASE_SERVICE_ROLE_KEY")
@@ -183,6 +284,14 @@ def event_save_error(error: Exception) -> str:
     return f"We couldn't save the event. {backend_error_message(error)}"
 
 
+def coordinator_display_name(event: dict[str, Any], coordinator_email: str) -> str:
+    normalized_email = coordinator_email.strip().lower()
+    for coordinator in event.get("coordinators") or []:
+        if str(coordinator.get("email") or "").strip().lower() == normalized_email:
+            return str(coordinator.get("name") or "").strip() or "Event coordinator"
+    return "Event coordinator"
+
+
 def show_event_card(event: dict[str, Any], count: Optional[int]) -> None:
     with st.container(border=True):
         col_text, col_action = st.columns([4, 1])
@@ -236,7 +345,7 @@ def show_registration_form(
     fields = event.get("registration_fields") or []
     answers = {}
     allow_teams = bool(event.get("allow_team_registration", False))
-    maximum_team_size = max(2, min(int(event.get("max_team_size", 4)), 20))
+    maximum_team_size = max(2, min(int(event.get("max_team_size", 4)), 8))
     remaining = max(capacity - count, 0)
     team_sizes = list(range(1, min(maximum_team_size, remaining) + 1))
     team_size = 1
@@ -355,6 +464,25 @@ def show_event_detail(
             f"**📅 {format_datetime(event['starts_at'])}**  ·  **📍 {event['venue']}**"
         )
         st.write(event["description"])
+        st.markdown("#### Coordinator updates")
+        try:
+            announcements = list_event_announcements(client, event["id"])
+        except Exception as error:
+            st.error(
+                f"Couldn't load coordinator updates. {backend_error_message(error)}"
+            )
+            announcements = []
+        if announcements:
+            for announcement in announcements:
+                with st.container(border=True):
+                    st.write(announcement["body"])
+                    st.caption(
+                        f"Posted by "
+                        f"{coordinator_display_name(event, announcement['coordinator_email'])} · "
+                        f"{announcement['created_at']}"
+                    )
+        else:
+            st.caption("No coordinator updates yet.")
         coordinators = event.get("coordinators") or []
         if coordinators:
             st.markdown("#### Event coordinators")
@@ -531,6 +659,26 @@ def show_student_account(
                             for member in teammates
                         )
                     )
+                student_updates = []
+                if event.get("published"):
+                    try:
+                        student_updates = list_event_announcements(
+                            data_client,
+                            registration["event_id"],
+                        )
+                    except Exception as error:
+                        st.error(
+                            "Couldn't load event updates. "
+                            + backend_error_message(error)
+                        )
+                if student_updates:
+                    with st.expander("Coordinator updates"):
+                        for update in student_updates:
+                            st.write(update["body"])
+                            st.caption(
+                                f"{coordinator_display_name(event, update['coordinator_email'])} · "
+                                f"{update['created_at']}"
+                            )
                 for index, coordinator in enumerate(event.get("coordinators") or []):
                     coordinator_email = (
                         str(coordinator.get("email") or "").strip().lower()
@@ -569,7 +717,8 @@ def show_student_account(
                                     metadata.get("student_id", ""),
                                 )
                                 st.session_state["selected_conversation_id"] = thread["id"]
-                                request_navigation("Messages")
+                                st.session_state["account_chat_conversation_id"] = thread["id"]
+                                st.rerun()
                             except Exception as error:
                                 st.error(
                                     "Couldn't open coordinator chat. "
@@ -586,11 +735,43 @@ def show_student_account(
                 ):
                     st.session_state["selected_event_id"] = registration["event_id"]
                     request_navigation("Events")
+        inline_chat_id = st.session_state.get("account_chat_conversation_id")
+        if inline_chat_id:
+            try:
+                conversation = get_student_conversation(
+                    data_client,
+                    inline_chat_id,
+                    student_user.id,
+                )
+            except Exception as error:
+                st.error(
+                    f"Couldn't open your private chat. {backend_error_message(error)}"
+                )
+                conversation = None
+            if conversation:
+                with st.container(border=True):
+                    st.markdown("#### In-app coordinator chat")
+                    if st.button(
+                        "Close chat",
+                        key=f"close-account-chat-{inline_chat_id}",
+                    ):
+                        st.session_state.pop("account_chat_conversation_id", None)
+                        st.rerun()
+                    show_conversation_thread(
+                        data_client,
+                        student_user,
+                        conversation,
+                        key_prefix="student-account",
+                    )
+            else:
+                st.session_state.pop("account_chat_conversation_id", None)
         if st.button("Sign out of student account", key="student-sign-out"):
             try:
                 auth_client.auth.sign_out()
             finally:
                 clear_student_session(st.session_state)
+                st.session_state.pop("account_chat_conversation_id", None)
+                st.session_state.pop("selected_conversation_id", None)
             st.rerun()
         return
 
@@ -687,7 +868,34 @@ def show_messages(client: Client, student_user: Optional[Any]) -> None:
         st.rerun()
 
     email = (student_user.email or "").strip().lower()
-    show_coordinator_workspace(client, email)
+    try:
+        assigned_events = get_coordinator_events(client, email)
+    except Exception as error:
+        st.error(
+            f"Couldn't load the coordinator workspace. {backend_error_message(error)}"
+        )
+        assigned_events = []
+    if assigned_events:
+        coordinator_tab, inbox_tab = st.tabs(
+            ["Coordinator workspace", "Student / coordinator chats"]
+        )
+        with coordinator_tab:
+            show_coordinator_workspace(client, email, assigned_events)
+        with inbox_tab:
+            show_chat_inbox(client, student_user, email)
+    else:
+        st.caption(
+            "No coordinator events are assigned to this account yet. Ask an admin "
+            "to assign this exact email to an event."
+        )
+        show_chat_inbox(client, student_user, email)
+
+
+def show_chat_inbox(
+    client: Client,
+    student_user: Any,
+    email: str,
+) -> None:
     try:
         threads = list_conversations(client, student_user.id, email)
     except Exception as error:
@@ -735,88 +943,20 @@ def show_messages(client: Client, student_user: Optional[Any]) -> None:
     )
     conversation = labels[selected_label]
     st.session_state["selected_conversation_id"] = conversation["id"]
-    event = conversation.get("events") or {}
-    st.caption(
-        f"{event.get('title', 'Event')} · "
-        f"with {conversation['coordinator_email'] if conversation['student_user_id'] == student_user.id else (conversation.get('student_name') or 'Student') + ' · ID ' + (conversation.get('student_id') or 'not provided') + ' (' + conversation['student_email'] + ')'}"
+    show_conversation_thread(
+        client,
+        student_user,
+        conversation,
+        key_prefix="messages",
     )
-    try:
-        messages = list_messages(client, conversation["id"])
-    except Exception as error:
-        st.error(f"Couldn't load messages. {backend_error_message(error)}")
-        return
-
-    for message in messages:
-        is_current_user = message["sender_user_id"] == student_user.id
-        with st.chat_message("user" if is_current_user else "assistant"):
-            st.caption(
-                "You" if is_current_user else message.get("sender_email", "Participant")
-            )
-            if message.get("body"):
-                st.write(message["body"])
-            if message.get("attachment_path"):
-                try:
-                    image_url = signed_chat_image_url(client, message["attachment_path"])
-                    st.image(image_url, caption="Photo attachment", width=420)
-                except Exception as error:
-                    st.warning(f"Couldn't load this photo. {backend_error_message(error)}")
-            st.caption(message["created_at"])
-
-    with st.form(f"send-message-{conversation['id']}", clear_on_submit=True):
-        body = st.text_area("Message", max_chars=4000, height=90)
-        attachment = st.file_uploader(
-            "Attach a photo (optional, up to 5 MB)",
-            type=["png", "jpg", "jpeg", "webp"],
-            key=f"chat-photo-{conversation['id']}",
-        )
-        send = st.form_submit_button("Send message", type="primary")
-    if send:
-        cleaned_body = body.strip()
-        if not cleaned_body and attachment is None:
-            st.warning("Write a message or attach a photo before sending.")
-            return
-        if attachment is not None and attachment.size > 5 * 1024 * 1024:
-            st.error("Chat photos must be 5 MB or smaller.")
-            return
-        attachment_path = None
-        try:
-            if attachment is not None:
-                attachment_path = upload_chat_image(
-                    client,
-                    conversation["id"],
-                    student_user.id,
-                    attachment,
-                )
-            send_message(
-                client,
-                conversation["id"],
-                student_user.id,
-                email,
-                cleaned_body,
-                attachment_path=attachment_path,
-            )
-            st.rerun()
-        except Exception as error:
-            if attachment_path:
-                try:
-                    client.storage.from_("chat-attachments").remove([attachment_path])
-                except Exception as cleanup_error:
-                    st.warning(
-                        "The photo upload could not be cleaned up after the message failed. "
-                        f"{backend_error_message(cleanup_error)}"
-                    )
-            st.error(f"Couldn't send this message. {backend_error_message(error)}")
 
 
-def show_coordinator_workspace(client: Client, coordinator_email: str) -> None:
-    try:
-        events = list_events(client, published_only=False)
-    except Exception as error:
-        st.error(
-            f"Couldn't load the coordinator workspace. {backend_error_message(error)}"
-        )
-        return
-    assigned_events = [
+def get_coordinator_events(
+    client: Client,
+    coordinator_email: str,
+) -> list[dict[str, Any]]:
+    events = list_events(client, published_only=False)
+    return [
         event
         for event in events
         if any(
@@ -824,17 +964,15 @@ def show_coordinator_workspace(client: Client, coordinator_email: str) -> None:
             for coordinator in event.get("coordinators") or []
         )
     ]
-    if not assigned_events:
-        st.caption(
-            "No coordinator events are assigned to this account yet. Ask an admin "
-            "to assign this exact email to an event."
-        )
-        return
 
-    st.markdown("### Coordinator workspace")
+def show_coordinator_workspace(
+    client: Client,
+    coordinator_email: str,
+    assigned_events: list[dict[str, Any]],
+) -> None:
     st.caption(
         "Your coordinator tools are limited to the events assigned to this account. "
-        "Student contact details are private; use them only to coordinate the event."
+        "Review participant rosters, answer student chats, and post public event updates."
     )
     for event in assigned_events:
         with st.expander(f"{event['title']} · {event['venue']}", expanded=True):
@@ -865,6 +1003,73 @@ def show_coordinator_workspace(client: Client, coordinator_email: str) -> None:
                     "No students have registered yet. Their chats will appear below "
                     "after they contact you."
                 )
+
+            if event.get("published"):
+                st.markdown("#### Post a public update")
+                with st.form(
+                    f"coordinator-update-{event['id']}",
+                    clear_on_submit=True,
+                ):
+                    update_body = st.text_area(
+                        "Update visible to all students on the event page",
+                        max_chars=2000,
+                        key=f"coordinator-update-body-{event['id']}",
+                    )
+                    submitted = st.form_submit_button("Publish update", type="primary")
+                if submitted:
+                    try:
+                        create_event_announcement(
+                            client,
+                            event["id"],
+                            coordinator_email,
+                            update_body,
+                        )
+                        st.success(
+                            "Your update is now visible on the public event page."
+                        )
+                        st.rerun()
+                    except Exception as error:
+                        st.error(
+                            "Couldn't publish this update. "
+                            + backend_error_message(error)
+                        )
+            else:
+                st.info("Public updates are available after the admin publishes this event.")
+
+            try:
+                announcements = list_event_announcements(client, event["id"])
+            except Exception as error:
+                st.error(
+                    f"Couldn't load coordinator updates. {backend_error_message(error)}"
+                )
+                announcements = []
+            if announcements:
+                for announcement in announcements:
+                    with st.container(border=True):
+                        st.write(announcement["body"])
+                        st.caption(
+                            f"{announcement['coordinator_email']} · "
+                            f"{announcement['created_at']}"
+                        )
+                        if announcement["coordinator_email"] == coordinator_email:
+                            if st.button(
+                                "Remove update",
+                                key=f"remove-update-{announcement['id']}",
+                            ):
+                                try:
+                                    delete_event_announcement(
+                                        client,
+                                        announcement["id"],
+                                        coordinator_email,
+                                    )
+                                    st.rerun()
+                                except Exception as error:
+                                    st.error(
+                                        "Couldn't remove this update. "
+                                        + backend_error_message(error)
+                                    )
+            else:
+                st.caption("No public updates have been posted for this event yet.")
 
 
 def is_admin_authenticated() -> bool:
@@ -951,8 +1156,8 @@ def event_form(
         max_team_size = st.number_input(
             "Maximum team size (including the team lead)",
             min_value=2,
-            max_value=20,
-            value=max(2, min(default_max_team_size, 20)),
+            max_value=8,
+            value=max(2, min(default_max_team_size, 8)),
             step=1,
             disabled=not allow_teams,
         )

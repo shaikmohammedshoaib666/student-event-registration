@@ -12,7 +12,7 @@ def validate_team_members(
     team_size: int,
     leader_student_id: str,
 ) -> tuple[Optional[list[dict[str, str]]], list[str]]:
-    if not 1 <= team_size <= 20:
+    if not 1 <= team_size <= 8:
         return None, ["A team must include at least the registering student."]
 
     member_rows = rows[: max(team_size - 1, 0)]

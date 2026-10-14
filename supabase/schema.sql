@@ -9,7 +9,7 @@ create table if not exists public.events (
     venue text not null check (char_length(venue) between 1 and 200),
     capacity integer not null check (capacity > 0),
     allow_team_registration boolean not null default false,
-    max_team_size integer not null default 4 check (max_team_size between 2 and 20),
+    max_team_size integer not null default 4 check (max_team_size between 2 and 8),
     registration_fields jsonb not null default '[]'::jsonb
         check (jsonb_typeof(registration_fields) = 'array'),
     coordinators jsonb not null default '[]'::jsonb
@@ -25,8 +25,15 @@ alter table public.events
 alter table public.events
     add column if not exists allow_team_registration boolean not null default false;
 alter table public.events
-    add column if not exists max_team_size integer not null default 4
-        check (max_team_size between 2 and 20);
+    add column if not exists max_team_size integer not null default 4;
+alter table public.events
+    drop constraint if exists events_max_team_size_check;
+update public.events
+   set max_team_size = least(greatest(max_team_size, 2), 8)
+ where max_team_size not between 2 and 8;
+alter table public.events
+    add constraint events_max_team_size_check
+        check (max_team_size between 2 and 8);
 
 create or replace function public.set_event_updated_at()
 returns trigger
@@ -83,6 +90,46 @@ create table if not exists public.event_photos (
     created_at timestamptz not null default now()
 );
 create index if not exists event_photos_event_id_idx on public.event_photos(event_id);
+
+create table if not exists public.event_announcements (
+    id uuid primary key default gen_random_uuid(),
+    event_id uuid not null references public.events(id) on delete cascade,
+    coordinator_email text not null,
+    body text not null check (char_length(body) between 1 and 2000),
+    created_at timestamptz not null default now()
+);
+create index if not exists event_announcements_event_idx
+    on public.event_announcements(event_id, created_at desc);
+
+create or replace function public.validate_event_announcement_coordinator()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+    if not exists (
+        select 1
+          from public.events e
+         where e.id = new.event_id
+           and e.published = true
+           and exists (
+               select 1
+                 from jsonb_array_elements(e.coordinators) as coordinator(value)
+                where lower(trim(coordinator.value->>'email')) =
+                      lower(trim(new.coordinator_email))
+           )
+    ) then
+        raise exception 'event_announcement_not_authorized' using errcode = 'P0001';
+    end if;
+    return new;
+end;
+$$;
+
+drop trigger if exists event_announcements_validate_coordinator
+    on public.event_announcements;
+create trigger event_announcements_validate_coordinator
+before insert on public.event_announcements
+for each row execute function public.validate_event_announcement_coordinator();
 
 create table if not exists public.event_conversations (
     id uuid primary key default gen_random_uuid(),
@@ -289,6 +336,7 @@ for each row execute function public.check_event_capacity_update();
 alter table public.events enable row level security;
 alter table public.registrations enable row level security;
 alter table public.event_photos enable row level security;
+alter table public.event_announcements enable row level security;
 alter table public.event_conversations enable row level security;
 alter table public.event_messages enable row level security;
 
@@ -305,16 +353,29 @@ using (exists (
     where e.id = event_id and e.published = true
 ));
 
+drop policy if exists "Public can read announcements for published events"
+    on public.event_announcements;
+create policy "Public can read announcements for published events"
+on public.event_announcements for select to anon, authenticated
+using (exists (
+    select 1 from public.events e
+    where e.id = event_id and e.published = true
+));
+
 -- All writes and all registration data access go through the server-side app.
 -- The service-role key bypasses RLS; never expose it to browsers or check it in.
 revoke all on public.events, public.registrations, public.event_photos
     from anon, authenticated;
+revoke all on public.event_announcements from anon, authenticated;
 revoke all on public.event_conversations, public.event_messages
     from anon, authenticated;
 revoke all on public.event_registration_counts from anon, authenticated;
 grant select on public.events, public.event_photos to anon, authenticated;
+grant select (id, event_id, body, created_at)
+    on public.event_announcements to anon, authenticated;
 grant select, insert, update, delete on public.events, public.registrations, public.event_photos
     to service_role;
+grant select, insert, update, delete on public.event_announcements to service_role;
 grant select, insert, update, delete on public.event_conversations, public.event_messages
     to service_role;
 grant select on public.event_registration_counts to service_role;

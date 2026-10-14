@@ -54,6 +54,7 @@ class FakeQuery:
             "event_photos",
             "event_conversations",
             "event_messages",
+            "event_announcements",
         ):
             return FakeResult([])
         raise AssertionError(f"Unexpected Supabase table: {self.table}")
@@ -111,7 +112,7 @@ def test_student_and_admin_views_render_with_event_registration_form(monkeypatch
         "capacity": 40,
         "published": True,
         "allow_team_registration": True,
-        "max_team_size": 4,
+        "max_team_size": 8,
         "coordinators": [
             {
                 "name": "Jordan Coordinator",
@@ -162,10 +163,21 @@ def test_student_and_admin_views_render_with_event_registration_form(monkeypatch
         "Admin login / dashboard",
     ]
     assert any("Campus welcome" in block.value for block in app.markdown)
+    assert any("Coordinator updates" in block.value for block in app.markdown)
     assert any(selectbox.label == "Meal choice *" for selectbox in app.selectbox)
     assert any(
         selectbox.label == "How many people are registering? (including you)"
-        and selectbox.options == ["1 person", "2 people", "3 people", "4 people"]
+        and selectbox.options
+        == [
+            "1 person",
+            "2 people",
+            "3 people",
+            "4 people",
+            "5 people",
+            "6 people",
+            "7 people",
+            "8 people",
+        ]
         for selectbox in app.selectbox
     )
     team_size_select = next(
@@ -173,11 +185,11 @@ def test_student_and_admin_views_render_with_event_registration_form(monkeypatch
         for selectbox in app.selectbox
         if selectbox.label == "How many people are registering? (including you)"
     )
-    team_size_select.set_value(4)
+    team_size_select.set_value(8)
     app.run()
     assert not app.exception
     assert any(
-        input_widget.key == "team-member-id-event-1-student-1-4"
+        input_widget.key == "team-member-id-event-1-student-1-8"
         for input_widget in app.text_input
     )
     assert any(link.label == "Call" for link in app.get("link_button"))
@@ -435,7 +447,7 @@ def test_student_account_view_event_button_navigates_without_widget_error(monkey
     assert any("Campus welcome" in item.value for item in app.markdown)
 
 
-def test_student_account_chat_button_navigates_to_messages_without_widget_error(
+def test_student_account_chat_button_opens_chat_inline_without_widget_error(
     monkeypatch,
 ):
     event = {
@@ -476,6 +488,16 @@ def test_student_account_chat_button_navigates_to_messages_without_widget_error(
         "get_or_create_conversation",
         lambda *_args, **_kwargs: {"id": "conversation-1"},
     )
+    monkeypatch.setattr(
+        chat,
+        "get_student_conversation",
+        lambda *_args, **_kwargs: {
+            "id": "conversation-1",
+            "student_user_id": "student-1",
+            "coordinator_email": "coordinator@example.edu",
+            "events": {"title": "Campus welcome"},
+        },
+    )
     app = AppTest.from_file(
         str(Path(__file__).resolve().parents[1] / "app.py"),
         default_timeout=20,
@@ -496,8 +518,9 @@ def test_student_account_chat_button_navigates_to_messages_without_widget_error(
     app.run()
 
     assert not app.exception
-    assert app.radio[0].value == "Messages"
-    assert any(item.value == "Coordinator messages" for item in app.title)
+    assert app.radio[0].value == "Student account"
+    assert any("In-app coordinator chat" in item.value for item in app.markdown)
+    assert any(item.label == "Message" for item in app.text_area)
 
 
 def test_assigned_coordinator_sees_only_scoped_workspace_on_messages(monkeypatch):
@@ -553,5 +576,8 @@ def test_assigned_coordinator_sees_only_scoped_workspace_on_messages(monkeypatch
     app.run()
 
     assert not app.exception
-    assert any("Coordinator workspace" in item.value for item in app.markdown)
+    assert any(item.label == "Coordinator workspace" for item in app.tabs)
     assert any("Registered Student" in str(frame.value) for frame in app.dataframe)
+    assert any(
+        button.label == "Publish update" for button in app.button
+    )
