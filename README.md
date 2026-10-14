@@ -7,7 +7,9 @@ A student-friendly event discovery and registration app built with Streamlit and
 - Browse published upcoming events, event details, photos, venue, date/time, capacity, and available spaces.
 - Students create an account with Supabase Auth using their name, student ID, email, and optional phone number; event details remain browsable without signing in, but registration requires a student account.
 - Prevent duplicate registrations per event and student ID/account; database triggers serialize registrations and enforce capacity.
-- Admin-only event creation, editing, publishing/unpublishing, photo uploads/removals, and per-event CSV registration exports.
+- The admin dashboard can assign up to 10 coordinators to an event by name, phone, and Supabase account email. Students can tap to call or open WhatsApp from a phone, or use persisted in-app messages when the coordinator email is assigned.
+- Coordinators sign in through the same Supabase student account flow, using the email assigned to the event; their inbox shows only threads addressed to that email.
+- Admin-only event creation, editing, publishing/unpublishing, photo uploads/removals, editable signup questions, and per-event CSV registration exports.
 - Admins can add up to 12 required/optional student registration questions per event (short answer, paragraph, dropdown, or checkbox); answers appear in the registration table and CSV export.
 - Server-side-only Supabase service-role access with database row-level security enabled.
 
@@ -25,18 +27,22 @@ A student-friendly event discovery and registration app built with Streamlit and
 
 The app's server-side secret/service-role key remains on the Streamlit server and is never sent to student browsers. Student passwords are handled by Supabase Auth; verified user sessions are kept server-side, and each registration is tied to the authenticated Supabase user. Admin authentication is separate and supports up to three email/password pairs from the server-side `[ADMIN_USERS]` secrets table. Use actual admin email addresses and different passwords with at least 16 characters; no default credentials are enabled.
 
+## App navigation and coordinators
+
+The expanded sidebar has **Events**, **Student account**, **Messages**, and **Admin login / dashboard**. Admins choose **Admin login / dashboard** and sign in with an email/password pair configured in Streamlit Secrets under `[ADMIN_USERS]`; there is no admin signup form. Students and coordinators use **Student account** with Supabase Auth. To assign a coordinator, an admin adds the coordinator's name, phone (including country code), and the email they will use for a student account while creating or editing an event. A student can use call/WhatsApp links or open an in-app chat with that assigned email. A coordinator creates/signs into the account with the assigned email, then opens **Messages** to respond. Messages persist in Supabase; refresh the page to check for new replies.
+
 ## Deploy to Streamlit Community Cloud
 
 1. Push this repository to GitHub and create a Community Cloud app for it, using `app.py` as the main file.
 2. In the app's **Settings → Secrets**, add the same TOML keys shown in `.streamlit/secrets.toml.example`, using the project URL, publishable key, server-side service-role/secret key, the actual admin email/password pairs under `[ADMIN_USERS]`, and the campus IANA time zone.
-3. Deploy and verify the public event list loads. Sign in to the Admin tab to create/publish an event and upload a test photo.
+3. Deploy and verify the public event list loads. Choose **Admin login / dashboard** in the visible left sidebar to sign in, then create/publish an event and upload a test photo.
 4. Keep the service-role key exclusively in Streamlit Cloud secrets. Rotate it in Supabase if it is ever exposed.
 
 ## Database and security notes
 
-The schema enables RLS on all application tables. Anonymous and authenticated roles can only read published event details and their public event photos; they cannot read registrations or write application data. Streamlit verifies students with Supabase Auth and performs database writes and admin reads server-side. SQL constraints and triggers enforce valid capacities, unique event/student and event/account registrations, published-event registration, and capacity even when simultaneous submissions compete for the final place.
+The schema enables RLS on all application tables. Anonymous and authenticated roles can only read published event details and their public event photos; they cannot read registrations or write application data. Streamlit verifies students with Supabase Auth and performs database writes, chat participant filtering, and admin reads server-side. SQL constraints and triggers enforce valid capacities, unique event/student and event/account registrations, published-event registration, and capacity even when simultaneous submissions compete for the final place.
 
-If you initialized the database using an earlier version of the schema, run the latest `supabase/schema.sql` in the SQL Editor to add the student account linkage, registration answers, and event question definitions. The script is idempotent for these setup steps, but review migrations before applying schema changes to an existing production database. If you change the storage bucket name in Streamlit secrets, update the bucket ID and storage policy in the SQL to match.
+If you initialized the database using an earlier version of the schema, run the latest `supabase/schema.sql` in the SQL Editor to add student account linkage, registration answers, event question definitions, coordinator contacts, and chat tables. The script requests a PostgREST schema-cache reload at the end. It is idempotent for these setup steps, but review migrations before applying schema changes to an existing production database. If you change the storage bucket name in Streamlit secrets, update the bucket ID and storage policy in the SQL to match.
 
 If the event list displays a database setup error, follow its specific guidance. A missing-table/column message means the latest schema has not been applied to the same Supabase project whose URL is in Streamlit Secrets. An invalid-key/permission message means to check the project URL and server-side key; re-run the schema after confirming the project.
 

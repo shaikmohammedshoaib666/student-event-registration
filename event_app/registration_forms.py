@@ -1,5 +1,6 @@
 """Validation and rendering-independent logic for admin-defined event questions."""
 
+import re
 from math import isnan
 from typing import Any, Optional
 
@@ -11,6 +12,7 @@ EDITOR_TYPES = {
     "Checkbox": "checkbox",
 }
 DISPLAY_TYPES = {value: key for key, value in EDITOR_TYPES.items()}
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 RESERVED_LABELS = {
     "student name",
     "student id",
@@ -43,6 +45,54 @@ def editor_rows(fields: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def coordinator_editor_rows(coordinators: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "Name": coordinator.get("name", ""),
+            "Email": coordinator.get("email", ""),
+            "Phone": coordinator.get("phone", ""),
+        }
+        for coordinator in coordinators or []
+    ]
+
+
+def validate_coordinators(
+    rows: list[dict[str, Any]],
+) -> tuple[Optional[list[dict[str, str]]], list[str]]:
+    coordinators = []
+    errors = []
+    seen_emails = set()
+
+    for row in rows:
+        name = " ".join(str(_cell_value(row.get("Name"))).split())
+        email = str(_cell_value(row.get("Email"))).strip().lower()
+        phone = str(_cell_value(row.get("Phone"))).strip()
+        if not name and not email and not phone:
+            continue
+        if not name:
+            errors.append("Add a name for every event coordinator.")
+            continue
+        if email and not EMAIL_PATTERN.fullmatch(email):
+            errors.append(f"Enter a valid email for coordinator {name}.")
+            continue
+        if email in seen_emails:
+            errors.append(f"Coordinator email must be unique: {email}.")
+            continue
+        if not email and not phone:
+            errors.append(f"Add an email or phone number for coordinator {name}.")
+            continue
+        if phone and not all(character.isdigit() or character in "+ ()-." for character in phone):
+            errors.append(f"Enter a valid phone number for coordinator {name}.")
+            continue
+        if email:
+            seen_emails.add(email)
+        coordinators.append({"name": name, "email": email, "phone": phone})
+
+    if len(coordinators) > 10:
+        errors.append("An event can have at most 10 coordinators.")
+    return (None, errors) if errors else (coordinators, [])
 
 
 def validate_registration_fields(

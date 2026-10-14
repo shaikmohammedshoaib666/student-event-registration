@@ -24,14 +24,25 @@ class FakeQuery:
     def eq(self, *_args):
         return self
 
+    def limit(self, *_args):
+        return self
+
+    def insert(self, *_args):
+        return self
+
     def execute(self):
         if self.table == "events":
-            return FakeResult([self.event])
+            return FakeResult([self.event] if self.event else [])
         if self.table == "event_registration_counts":
-            return FakeResult(
-                [{"event_id": self.event["id"], "registration_count": 0}]
-            )
-        if self.table in ("event_photos", "registrations"):
+            if not self.event:
+                return FakeResult([])
+            return FakeResult([{"event_id": self.event["id"], "registration_count": 0}])
+        if self.table in (
+            "event_photos",
+            "registrations",
+            "event_conversations",
+            "event_messages",
+        ):
             return FakeResult([])
         raise AssertionError(f"Unexpected Supabase table: {self.table}")
 
@@ -86,6 +97,13 @@ def test_student_and_admin_views_render_with_event_registration_form(monkeypatch
         "venue": "Main Hall",
         "capacity": 40,
         "published": True,
+        "coordinators": [
+            {
+                "name": "Jordan Coordinator",
+                "email": "coordinator@example.edu",
+                "phone": "+15551234567",
+            }
+        ],
         "registration_fields": [
             {
                 "label": "Meal choice",
@@ -122,11 +140,126 @@ def test_student_and_admin_views_render_with_event_registration_form(monkeypatch
     app.run()
 
     assert not app.exception
-    assert [tab.label for tab in app.tabs[:3]] == [
-        "Discover events",
+    assert app.radio[0].options == [
+        "Events",
         "Student account",
-        "Admin",
+        "Messages",
+        "Admin login / dashboard",
     ]
     assert any("Campus welcome" in block.value for block in app.markdown)
     assert any(selectbox.label == "Meal choice *" for selectbox in app.selectbox)
-    assert len(app.dataframe) == 2
+    assert any(link.label == "Call" for link in app.get("link_button"))
+    assert any(link.label == "WhatsApp" for link in app.get("link_button"))
+    assert any("Jordan Coordinator" in block.value for block in app.markdown)
+
+
+def test_admin_dashboard_exposes_admin_login_route(monkeypatch):
+    event = {
+        "id": "event-1",
+        "title": "Campus welcome",
+        "description": "Welcome to campus",
+        "starts_at": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
+        "venue": "Main Hall",
+        "capacity": 40,
+        "published": False,
+        "registration_fields": [],
+        "coordinators": [],
+    }
+    monkeypatch.setattr(
+        supabase,
+        "create_client",
+        lambda *_args, **_kwargs: FakeClient(event),
+    )
+    app = AppTest.from_file(
+        str(Path(__file__).resolve().parents[1] / "app.py"),
+        default_timeout=20,
+    )
+    app.secrets.update(
+        {
+            "SUPABASE_URL": "https://example.supabase.co",
+            "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_test",
+            "SUPABASE_SERVICE_ROLE_KEY": "sb_secret_test",
+            "ADMIN_USERS": {
+                "admin@example.edu": "a-long-test-admin-password",
+            },
+        }
+    )
+    app.session_state["app_section"] = "Admin login / dashboard"
+
+    app.run()
+
+    assert not app.exception
+    assert any(text.label == "Admin email" for text in app.text_input)
+    assert any(text.label == "Admin password" for text in app.text_input)
+
+    app.session_state["admin_email"] = "admin@example.edu"
+    app.run()
+
+    assert not app.exception
+    assert len(app.dataframe) == 4
+    assert any(
+        "Event coordinators" in item.value for item in app.markdown
+    )
+
+
+def test_empty_events_page_points_organizers_to_admin_login(monkeypatch):
+    monkeypatch.setattr(
+        supabase,
+        "create_client",
+        lambda *_args, **_kwargs: FakeClient(None),
+    )
+    app = AppTest.from_file(
+        str(Path(__file__).resolve().parents[1] / "app.py"),
+        default_timeout=20,
+    )
+    app.secrets.update(
+        {
+            "SUPABASE_URL": "https://example.supabase.co",
+            "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_test",
+            "SUPABASE_SERVICE_ROLE_KEY": "sb_secret_test",
+            "ADMIN_USERS": {"admin@example.edu": "a-long-test-admin-password"},
+        }
+    )
+
+    app.run()
+
+    assert not app.exception
+    assert any("No upcoming events" in item.value for item in app.info)
+    assert any("Admin login / dashboard" in item.value for item in app.markdown)
+
+
+def test_message_section_explains_student_and_coordinator_account_login(monkeypatch):
+    event = {
+        "id": "event-1",
+        "title": "Campus welcome",
+        "description": "Welcome to campus",
+        "starts_at": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
+        "venue": "Main Hall",
+        "capacity": 40,
+        "published": True,
+        "registration_fields": [],
+        "coordinators": [],
+    }
+    monkeypatch.setattr(
+        supabase,
+        "create_client",
+        lambda *_args, **_kwargs: FakeClient(event),
+    )
+    app = AppTest.from_file(
+        str(Path(__file__).resolve().parents[1] / "app.py"),
+        default_timeout=20,
+    )
+    app.secrets.update(
+        {
+            "SUPABASE_URL": "https://example.supabase.co",
+            "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_test",
+            "SUPABASE_SERVICE_ROLE_KEY": "sb_secret_test",
+            "ADMIN_USERS": {"admin@example.edu": "a-long-test-admin-password"},
+        }
+    )
+    app.session_state["app_section"] = "Messages"
+
+    app.run()
+
+    assert not app.exception
+    assert any("Sign in or create a student account" in item.value for item in app.info)

@@ -1,8 +1,10 @@
 import math
 
 from event_app.registration_forms import (
+    coordinator_editor_rows,
     editor_rows,
     flatten_registration,
+    validate_coordinators,
     validate_registration_answers,
     validate_registration_fields,
 )
@@ -130,3 +132,31 @@ def test_flattening_keeps_answers_to_questions_removed_from_event():
     )
 
     assert result["Old question"] == "Historical answer"
+
+
+def test_coordinator_editor_preserves_contacts_for_phone_and_chat():
+    coordinators = [
+        {
+            "name": "Jordan Coordinator",
+            "email": "jordan@example.edu",
+            "phone": "+1 (555) 123-4567",
+        }
+    ]
+
+    rows = coordinator_editor_rows(coordinators)
+    saved, errors = validate_coordinators(rows)
+
+    assert errors == []
+    assert saved == coordinators
+
+
+def test_coordinators_need_valid_name_and_a_phone_or_account_email():
+    saved, errors = validate_coordinators(
+        [
+            {"Name": " ", "Email": "bad-email", "Phone": ""},
+            {"Name": "Taylor", "Email": "", "Phone": ""},
+        ]
+    )
+
+    assert saved is None
+    assert len(errors) == 2

@@ -12,10 +12,18 @@ from streamlit.errors import StreamlitSecretNotFoundError
 
 from event_app.admin_auth import admin_configuration_error, authenticate_admin
 from event_app.backend_errors import backend_error_message
+from event_app.chat import (
+    get_or_create_conversation,
+    list_conversations,
+    list_messages,
+    send_message,
+)
 from event_app.exports import registrations_csv
 from event_app.registration_forms import (
+    coordinator_editor_rows,
     editor_rows,
     flatten_registration,
+    validate_coordinators,
     validate_registration_answers,
     validate_registration_fields,
 )
@@ -43,7 +51,7 @@ st.set_page_config(
     page_title="Campus Connect | Student Events",
     page_icon="🎓",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 st.markdown(
@@ -59,10 +67,8 @@ st.markdown(
     .hero p { color: var(--muted); font-size: 1.1rem; max-width: 690px; }
     [data-testid="stVerticalBlockBorderWrapper"] { background: white; border-radius: 18px; border-color: #e9ecf4; }
     [data-testid="stMetric"] { background: var(--mint); padding: .8rem 1rem; border-radius: 12px; }
-    .stTabs [data-baseweb="tab-list"] { gap: .5rem; border-bottom: 1px solid #d9deea; }
-    .stTabs [data-baseweb="tab"] { color: #35415a !important; font-weight: 700; }
-    .stTabs [data-baseweb="tab"][aria-selected="true"] { color: #4b5ce2 !important; }
-    .stTabs [data-baseweb="tab-highlight"] { background-color: #4b5ce2; }
+    [data-testid="stSidebar"] { background: #eef1fb; }
+    [data-testid="stSidebar"] label, [data-testid="stSidebar"] p { color: #17243b !important; }
     .tag { color: #3546c6; font-weight: 700; background: #eef0ff; padding: .3rem .65rem; border-radius: 99px; font-size: .82rem; }
     div.stButton > button[kind="primary"] { background: var(--brand); border-color: var(--brand); }
     @media (max-width: 640px) { .hero { padding-top: 1rem; } }
@@ -231,6 +237,7 @@ def show_event_detail(
     event: dict[str, Any],
     count: Optional[int],
     student_user: Optional[Any],
+    student_email: Optional[str],
 ) -> None:
     st.markdown("---")
     if st.button("← Back to all events", key="back-to-events"):
@@ -242,6 +249,53 @@ def show_event_detail(
             f"**📅 {format_datetime(event['starts_at'])}**  ·  **📍 {event['venue']}**"
         )
         st.write(event["description"])
+        coordinators = event.get("coordinators") or []
+        if coordinators:
+            st.markdown("#### Event coordinators")
+            for index, coordinator in enumerate(coordinators):
+                name = coordinator.get("name", "Event coordinator")
+                email = (coordinator.get("email") or "").strip().lower()
+                phone = (coordinator.get("phone") or "").strip()
+                contact_cols = st.columns([2, 1, 1, 2])
+                contact_cols[0].markdown(f"**{name}**")
+                if phone:
+                    digits = "".join(character for character in phone if character.isdigit())
+                    if digits:
+                        contact_cols[1].link_button(
+                            "Call",
+                            f"tel:{phone}",
+                        )
+                        contact_cols[2].link_button(
+                            "WhatsApp",
+                            f"https://wa.me/{digits}",
+                        )
+                if email:
+                    if student_user and student_email:
+                        if contact_cols[3].button(
+                            f"Chat with {name}",
+                            key=f"chat-coordinator-{event['id']}-{index}",
+                            type="primary",
+                        ):
+                            thread = get_or_create_conversation(
+                                client,
+                                event["id"],
+                                student_user.id,
+                                student_email,
+                                (student_user.user_metadata or {}).get(
+                                    "student_name",
+                                    student_email,
+                                ),
+                                email,
+                            )
+                            st.session_state["selected_conversation_id"] = thread["id"]
+                            st.session_state["app_section"] = "Messages"
+                            st.rerun()
+                    else:
+                        contact_cols[3].caption("Sign in to message in the app")
+                elif student_user:
+                    st.caption(
+                        f"{name} can be messaged in-app after the admin assigns their coordinator account email."
+                    )
         left, right = st.columns([2, 1])
         with left:
             try:
@@ -291,6 +345,11 @@ def show_public_view(client: Client, student_user: Optional[Any]) -> None:
     st.markdown("### Upcoming on campus")
     if not upcoming:
         st.info("No upcoming events just yet. Check back soon!")
+        st.markdown(
+            "Are you organizing an event? Choose **Admin login / dashboard** in the left "
+            "navigation, sign in with your configured admin email and password, and publish "
+            "your first event."
+        )
         return
     availability_loaded = bool(counts) or not events
     for event in upcoming:
@@ -308,6 +367,7 @@ def show_public_view(client: Client, student_user: Optional[Any]) -> None:
                 event,
                 counts.get(event["id"], 0) if availability_loaded else None,
                 student_user,
+                getattr(student_user, "email", None),
             )
 
 
@@ -326,8 +386,13 @@ def show_student_account(auth_client: Client, student_user: Optional[Any]) -> No
 
     if st.session_state.pop("student_auth_error", False):
         st.warning("Your student session couldn't be verified. Please sign in again.")
-    sign_in_tab, create_account_tab = st.tabs(["Sign in", "Create account"])
-    with sign_in_tab:
+    account_action = st.radio(
+        "Choose an account action",
+        ["Sign in", "Create account"],
+        horizontal=True,
+        key="student_account_action",
+    )
+    if account_action == "Sign in":
         with st.form("student-sign-in"):
             email = st.text_input("Email", key="student-login-email")
             password = st.text_input("Password", type="password", key="student-login-password")
@@ -344,7 +409,7 @@ def show_student_account(auth_client: Client, student_user: Optional[Any]) -> No
             except Exception:
                 st.error("We couldn't sign you in. Check your email and password, then try again.")
 
-    with create_account_tab:
+    else:
         st.caption("Use one account to register for campus events. You can still browse events without signing in.")
         with st.form("student-create-account"):
             name = st.text_input("Full name", max_chars=100, key="student-signup-name")
@@ -397,6 +462,102 @@ def show_student_account(auth_client: Client, student_user: Optional[Any]) -> No
                         "We couldn't create that account. Check the details; if this email "
                         "is already registered, sign in instead."
                     )
+
+
+def show_messages(client: Client, student_user: Optional[Any]) -> None:
+    st.title("Coordinator messages")
+    if student_user is None:
+        st.info(
+            "Sign in or create a student account to message an event coordinator. "
+            "Coordinators sign in with the account email assigned to their event."
+        )
+        return
+
+    email = (student_user.email or "").strip().lower()
+    try:
+        threads = list_conversations(client, student_user.id, email)
+    except Exception as error:
+        st.error(f"Couldn't load your conversations. {backend_error_message(error)}")
+        return
+    if not threads:
+        st.info(
+            "No messages yet. Open an event, select Details, then choose “Chat with” "
+            "a coordinator."
+        )
+        return
+
+    labels = {}
+    for thread in threads:
+        event = thread.get("events") or {}
+        event_title = event.get("title", "Event")
+        if thread["student_user_id"] == student_user.id:
+            other_person = thread["coordinator_email"]
+            role = "Coordinator"
+        else:
+            other_person = (
+                f"{thread.get('student_name') or 'Student'} ({thread['student_email']})"
+            )
+            role = "Student"
+        labels[
+            f"{event_title} · {role}: {other_person} · {thread['id'][:8]}"
+        ] = thread
+    thread_labels = list(labels)
+    preferred_id = st.session_state.get("selected_conversation_id")
+    default_index = next(
+        (
+            index
+            for index, label in enumerate(thread_labels)
+            if labels[label]["id"] == preferred_id
+        ),
+        0,
+    )
+    selected_label = st.selectbox(
+        "Conversation",
+        thread_labels,
+        index=default_index,
+        key="selected-chat-thread",
+    )
+    conversation = labels[selected_label]
+    st.session_state["selected_conversation_id"] = conversation["id"]
+    event = conversation.get("events") or {}
+    st.caption(
+        f"{event.get('title', 'Event')} · "
+        f"with {conversation['coordinator_email'] if conversation['student_user_id'] == student_user.id else (conversation.get('student_name') or 'Student') + ' (' + conversation['student_email'] + ')'}"
+    )
+    try:
+        messages = list_messages(client, conversation["id"])
+    except Exception as error:
+        st.error(f"Couldn't load messages. {backend_error_message(error)}")
+        return
+
+    for message in messages:
+        is_current_user = message["sender_user_id"] == student_user.id
+        with st.chat_message("user" if is_current_user else "assistant"):
+            st.caption(
+                "You" if is_current_user else message.get("sender_email", "Participant")
+            )
+            st.write(message["body"])
+            st.caption(message["created_at"])
+
+    with st.form(f"send-message-{conversation['id']}", clear_on_submit=True):
+        body = st.text_area("Message", max_chars=4000, height=90)
+        send = st.form_submit_button("Send message", type="primary")
+    if send:
+        cleaned_body = body.strip()
+        if not cleaned_body:
+            st.warning("Write a message before sending.")
+            return
+        try:
+            send_message(
+                client,
+                conversation["id"],
+                student_user.id,
+                email,
+                cleaned_body,
+            )
+            st.rerun()
+        except Exception as error:
+            st.error(f"Couldn't send this message. {backend_error_message(error)}")
 
 
 def is_admin_authenticated() -> bool:
@@ -506,9 +667,32 @@ def event_form(
             hide_index=True,
             key=f"registration-fields-{key}",
         )
+        st.markdown("##### Event coordinators")
+        st.caption(
+            "Assign a coordinator name and phone for direct calls/WhatsApp. Add their "
+            "student-account email to enable in-app chat. Coordinators must create an "
+            "account with that same email to receive messages."
+        )
+        coordinator_rows = st.data_editor(
+            pd.DataFrame(
+                coordinator_editor_rows(event.get("coordinators", []) if event else []),
+                columns=["Name", "Email", "Phone"],
+            ),
+            column_config={
+                "Name": st.column_config.TextColumn("Name", required=True),
+                "Email": st.column_config.TextColumn("Account email for in-app chat"),
+                "Phone": st.column_config.TextColumn("Phone (include country code)"),
+            },
+            num_rows="dynamic",
+            hide_index=True,
+            key=f"coordinator-contacts-{key}",
+        )
         submitted = st.form_submit_button("Save event", type="primary")
 
     fields, field_errors = validate_registration_fields(question_rows.to_dict("records"))
+    coordinators, coordinator_errors = validate_coordinators(
+        coordinator_rows.to_dict("records")
+    )
     values = {
         "title": title.strip(),
         "description": description.strip(),
@@ -516,13 +700,14 @@ def event_form(
         "capacity": int(capacity),
         "published": published,
         "registration_fields": fields or [],
+        "coordinators": coordinators or [],
         "starts_at": (
             datetime.combine(event_date, event_time)
             .replace(tzinfo=configured_timezone())
             .isoformat()
         ),
     }
-    return submitted, values, field_errors
+    return submitted, values, field_errors + coordinator_errors
 
 
 def upload_event_photos(client: Client, event_id: str, files: list[Any]) -> None:
@@ -655,10 +840,15 @@ def show_admin_view(client: Client) -> None:
     except Exception as error:
         st.error(f"We couldn't load admin data. {backend_error_message(error)}")
         return
-    event_tab, registration_tab = st.tabs(["Manage events", "Registrations"])
-    with event_tab:
+    admin_section = st.radio(
+        "Admin tools",
+        ["Manage events", "Registrations"],
+        horizontal=True,
+        key="admin_tool_section",
+    )
+    if admin_section == "Manage events":
         show_event_admin(client, events)
-    with registration_tab:
+    else:
         show_registration_admin(client, events)
 
 
@@ -677,14 +867,33 @@ def main() -> None:
         return
 
     student_user = current_student(auth_client, st.session_state)
-    events_tab, account_tab, admin_tab = st.tabs(
-        ["Discover events", "Student account", "Admin"]
+    st.sidebar.title("Campus Connect")
+    st.sidebar.caption("Find campus events, register, and contact coordinators.")
+    if student_user:
+        profile = student_user.user_metadata or {}
+        st.sidebar.success(
+            f"Signed in: {profile.get('student_name', student_user.email)}"
+        )
+    else:
+        st.sidebar.info("Browse events as a guest. Sign in to register and chat.")
+    section = st.sidebar.radio(
+        "Go to",
+        ["Events", "Student account", "Messages", "Admin login / dashboard"],
+        key="app_section",
     )
-    with events_tab:
+    st.sidebar.markdown("---")
+    st.sidebar.caption(
+        "Admins: choose **Admin login / dashboard**. Students and coordinators "
+        "sign in with their Supabase accounts."
+    )
+
+    if section == "Events":
         show_public_view(client, student_user)
-    with account_tab:
+    elif section == "Student account":
         show_student_account(auth_client, student_user)
-    with admin_tab:
+    elif section == "Messages":
+        show_messages(client, student_user)
+    else:
         show_admin_view(client)
 
 

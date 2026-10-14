@@ -10,12 +10,16 @@ create table if not exists public.events (
     capacity integer not null check (capacity > 0),
     registration_fields jsonb not null default '[]'::jsonb
         check (jsonb_typeof(registration_fields) = 'array'),
+    coordinators jsonb not null default '[]'::jsonb
+        check (jsonb_typeof(coordinators) = 'array'),
     published boolean not null default false,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
 alter table public.events
     add column if not exists registration_fields jsonb not null default '[]'::jsonb;
+alter table public.events
+    add column if not exists coordinators jsonb not null default '[]'::jsonb;
 
 create or replace function public.set_event_updated_at()
 returns trigger
@@ -63,6 +67,53 @@ create table if not exists public.event_photos (
     created_at timestamptz not null default now()
 );
 create index if not exists event_photos_event_id_idx on public.event_photos(event_id);
+
+create table if not exists public.event_conversations (
+    id uuid primary key default gen_random_uuid(),
+    event_id uuid not null references public.events(id) on delete cascade,
+    student_user_id uuid not null references auth.users(id) on delete cascade,
+    student_email text not null,
+    student_name text not null,
+    coordinator_email text not null,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    constraint unique_event_student_coordinator
+        unique (event_id, student_user_id, coordinator_email)
+);
+alter table public.event_conversations
+    add column if not exists student_name text not null default 'Student';
+create index if not exists event_conversations_coordinator_idx
+    on public.event_conversations(coordinator_email, updated_at desc);
+
+create table if not exists public.event_messages (
+    id uuid primary key default gen_random_uuid(),
+    conversation_id uuid not null
+        references public.event_conversations(id) on delete cascade,
+    sender_user_id uuid not null references auth.users(id) on delete cascade,
+    sender_email text not null,
+    body text not null check (char_length(body) between 1 and 4000),
+    created_at timestamptz not null default now()
+);
+create index if not exists event_messages_conversation_idx
+    on public.event_messages(conversation_id, created_at);
+
+create or replace function public.set_conversation_updated_at()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+    update public.event_conversations
+       set updated_at = now()
+     where id = new.conversation_id;
+    return new;
+end;
+$$;
+
+drop trigger if exists event_messages_update_conversation on public.event_messages;
+create trigger event_messages_update_conversation
+after insert on public.event_messages
+for each row execute function public.set_conversation_updated_at();
 
 -- Counts are exposed to the server-side app using its service-role key.
 create or replace view public.event_registration_counts as
@@ -139,6 +190,8 @@ for each row execute function public.check_event_capacity_update();
 alter table public.events enable row level security;
 alter table public.registrations enable row level security;
 alter table public.event_photos enable row level security;
+alter table public.event_conversations enable row level security;
+alter table public.event_messages enable row level security;
 
 drop policy if exists "Public can read published events" on public.events;
 create policy "Public can read published events"
@@ -157,9 +210,13 @@ using (exists (
 -- The service-role key bypasses RLS; never expose it to browsers or check it in.
 revoke all on public.events, public.registrations, public.event_photos
     from anon, authenticated;
+revoke all on public.event_conversations, public.event_messages
+    from anon, authenticated;
 revoke all on public.event_registration_counts from anon, authenticated;
 grant select on public.events, public.event_photos to anon, authenticated;
 grant select, insert, update, delete on public.events, public.registrations, public.event_photos
+    to service_role;
+grant select, insert, update, delete on public.event_conversations, public.event_messages
     to service_role;
 grant select on public.event_registration_counts to service_role;
 
@@ -182,3 +239,5 @@ drop policy if exists "Public can read event photos" on storage.objects;
 create policy "Public can read event photos"
 on storage.objects for select to anon, authenticated
 using (bucket_id = 'event-photos');
+
+notify pgrst, 'reload schema';
