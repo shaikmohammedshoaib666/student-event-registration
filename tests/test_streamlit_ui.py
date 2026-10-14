@@ -97,6 +97,8 @@ def test_student_and_admin_views_render_with_event_registration_form(monkeypatch
         "venue": "Main Hall",
         "capacity": 40,
         "published": True,
+        "allow_team_registration": True,
+        "max_team_size": 4,
         "coordinators": [
             {
                 "name": "Jordan Coordinator",
@@ -148,6 +150,23 @@ def test_student_and_admin_views_render_with_event_registration_form(monkeypatch
     ]
     assert any("Campus welcome" in block.value for block in app.markdown)
     assert any(selectbox.label == "Meal choice *" for selectbox in app.selectbox)
+    assert any(
+        selectbox.label == "How many people are registering? (including you)"
+        and selectbox.options == ["1 person", "2 people", "3 people", "4 people"]
+        for selectbox in app.selectbox
+    )
+    team_size_select = next(
+        selectbox
+        for selectbox in app.selectbox
+        if selectbox.label == "How many people are registering? (including you)"
+    )
+    team_size_select.set_value(4)
+    app.run()
+    assert not app.exception
+    assert any(
+        input_widget.key == "team-member-id-event-1-student-1-4"
+        for input_widget in app.text_input
+    )
     assert any(link.label == "Call" for link in app.get("link_button"))
     assert any(link.label == "WhatsApp" for link in app.get("link_button"))
     assert any("Jordan Coordinator" in block.value for block in app.markdown)

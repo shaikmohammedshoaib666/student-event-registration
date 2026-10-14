@@ -134,6 +134,36 @@ def test_flattening_keeps_answers_to_questions_removed_from_event():
     assert result["Old question"] == "Historical answer"
 
 
+def test_flattening_exports_team_size_and_team_member_contact_details():
+    result = flatten_registration(
+        {
+            "student_name": "Ada Lovelace",
+            "student_id": "STU-1",
+            "email": "ada@example.edu",
+            "team_size": 3,
+            "team_members": [
+                {
+                    "name": "Grace Hopper",
+                    "student_id": "STU-2",
+                    "email": "grace@example.edu",
+                    "phone": "1234567",
+                },
+                {
+                    "name": "Katherine Johnson",
+                    "student_id": "STU-3",
+                    "email": "katherine@example.edu",
+                    "phone": "",
+                },
+            ],
+        },
+        [],
+    )
+
+    assert result["Team size"] == 3
+    assert "Grace Hopper · ID STU-2 · grace@example.edu · 1234567" in result["Team members"]
+    assert "Katherine Johnson · ID STU-3 · katherine@example.edu" in result["Team members"]
+
+
 def test_coordinator_editor_preserves_contacts_for_phone_and_chat():
     coordinators = [
         {

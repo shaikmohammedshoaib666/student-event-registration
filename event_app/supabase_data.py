@@ -48,12 +48,17 @@ def create_registration(
     student: dict[str, Optional[str]],
     user_id: str,
     answers: dict[str, Any],
+    *,
+    team_size: int = 1,
+    team_members: Optional[list[dict[str, str]]] = None,
 ) -> None:
     client.table("registrations").insert(
         {
             "event_id": event_id,
             "user_id": user_id,
             "form_answers": answers,
+            "team_size": team_size,
+            "team_members": team_members or [],
             **student,
         }
     ).execute()
@@ -62,7 +67,10 @@ def create_registration(
 def list_registrations(client: Any, event_id: str) -> list[dict[str, Any]]:
     return (
         client.table("registrations")
-        .select("student_name,student_id,email,phone,created_at,form_answers")
+        .select(
+            "student_name,student_id,email,phone,created_at,form_answers,"
+            "team_size,team_members"
+        )
         .eq("event_id", event_id)
         .order("created_at")
         .execute()

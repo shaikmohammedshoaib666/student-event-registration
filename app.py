@@ -46,6 +46,7 @@ from event_app.supabase_data import (
     save_event,
     save_photo_record,
 )
+from event_app.team_registration import validate_team_members
 from event_app.validation import validate_registration
 
 
@@ -135,6 +136,12 @@ def format_datetime(value: str) -> str:
 
 def error_message(error: Exception) -> str:
     detail = str(error).lower()
+    if "duplicate_team_student_id" in detail:
+        return "A student ID in this team is already registered for this event."
+    if "invalid_team_registration" in detail:
+        return "Check the team size and each teammate's details, then try again."
+    if "event_teams_not_allowed" in detail:
+        return "This event does not accept team registrations."
     if (
         "duplicate key" in detail
         or "unique_event_student" in detail
@@ -207,7 +214,52 @@ def show_registration_form(
     st.markdown("#### Save your spot")
     fields = event.get("registration_fields") or []
     answers = {}
+    allow_teams = bool(event.get("allow_team_registration", False))
+    maximum_team_size = max(2, min(int(event.get("max_team_size", 4)), 20))
+    remaining = max(capacity - count, 0)
+    team_sizes = list(range(1, min(maximum_team_size, remaining) + 1))
+    team_size = 1
+    if allow_teams:
+        team_size = st.selectbox(
+            "How many people are registering? (including you)",
+            options=team_sizes,
+            format_func=lambda size: f"{size} " + ("person" if size == 1 else "people"),
+            key=f"team-size-{event['id']}-{student_user.id}",
+        )
+        if team_size > 1:
+            st.caption(
+                f"You are the team lead. Enter the details for the other "
+                f"{team_size - 1} team member(s). This reserves {team_size} event spots."
+            )
     with st.form(f"register-{event['id']}-{student_user.id}"):
+        member_rows = []
+        if team_size > 1:
+            for index in range(2, team_size + 1):
+                st.markdown(f"##### Team member {index}")
+                member_name = st.text_input(
+                    "Full name",
+                    key=f"team-member-name-{event['id']}-{student_user.id}-{index}",
+                )
+                member_student_id = st.text_input(
+                    "Student ID",
+                    key=f"team-member-id-{event['id']}-{student_user.id}-{index}",
+                )
+                member_email = st.text_input(
+                    "Email",
+                    key=f"team-member-email-{event['id']}-{student_user.id}-{index}",
+                )
+                member_phone = st.text_input(
+                    "Phone (optional)",
+                    key=f"team-member-phone-{event['id']}-{student_user.id}-{index}",
+                )
+                member_rows.append(
+                    {
+                        "Name": member_name,
+                        "Student ID": member_student_id,
+                        "Email": member_email,
+                        "Phone": member_phone,
+                    }
+                )
         for index, field in enumerate(fields):
             key = f"registration-answer-{event['id']}-{student_user.id}-{index}"
             label = field["label"] + (" *" if field.get("required") else "")
@@ -232,14 +284,34 @@ def show_registration_form(
             use_container_width=True,
         )
     if submitted:
+        team_members, team_errors = validate_team_members(
+            member_rows,
+            team_size=team_size,
+            leader_student_id=student["student_id"],
+        )
+        if team_errors:
+            for message in team_errors:
+                st.error(message)
+            return
         answer_errors = validate_registration_answers(fields, answers)
         if answer_errors:
             for message in answer_errors:
                 st.error(message)
             return
         try:
-            create_registration(client, event["id"], student, student_user.id, answers)
-            st.success("You're in! Your registration has been saved.")
+            create_registration(
+                client,
+                event["id"],
+                student,
+                student_user.id,
+                answers,
+                team_size=team_size,
+                team_members=team_members or [],
+            )
+            st.success(
+                f"You're in! Your registration for {team_size} "
+                f"{'person' if team_size == 1 else 'people'} has been saved."
+            )
             st.rerun()
         except Exception as error:
             st.error(error_message(error))
@@ -665,6 +737,8 @@ def event_form(
     default_venue = event["venue"] if event else ""
     default_capacity = int(event["capacity"]) if event else 50
     default_published = bool(event["published"]) if event else False
+    default_allow_teams = bool(event.get("allow_team_registration", False)) if event else False
+    default_max_team_size = int(event.get("max_team_size", 4)) if event else 4
     if event:
         starts = datetime.fromisoformat(event["starts_at"].replace("Z", "+00:00")).astimezone(
             configured_timezone()
@@ -685,6 +759,19 @@ def event_form(
             event_time = st.time_input(f"Start time ({timezone_name})", value=default_time)
         with capacity_col:
             capacity = st.number_input("Capacity", min_value=1, max_value=100000, value=default_capacity, step=1)
+        allow_teams = st.checkbox(
+            "Allow team registrations",
+            value=default_allow_teams,
+            help="A student can register as the team lead and enter each teammate's details.",
+        )
+        max_team_size = st.number_input(
+            "Maximum team size (including the team lead)",
+            min_value=2,
+            max_value=20,
+            value=max(2, min(default_max_team_size, 20)),
+            step=1,
+            disabled=not allow_teams,
+        )
         published = st.checkbox("Published (visible to students)", value=default_published)
         st.markdown("##### Student registration questions")
         st.caption(
@@ -749,6 +836,8 @@ def event_form(
         "description": description.strip(),
         "venue": venue.strip(),
         "capacity": int(capacity),
+        "allow_team_registration": allow_teams,
+        "max_team_size": int(max_team_size),
         "published": published,
         "registration_fields": fields or [],
         "coordinators": coordinators or [],
@@ -889,7 +978,11 @@ def show_registration_admin(client: Client, events: list[dict[str, Any]]) -> Non
     except Exception as error:
         st.error(f"We couldn't load registrations. {backend_error_message(error)}")
         return
-    st.caption(f"{len(rows)} registered · capacity {event['capacity']}")
+    reserved_spots = sum(int(row.get("team_size") or 1) for row in rows)
+    st.caption(
+        f"{len(rows)} registration(s) · {reserved_spots} spot(s) reserved · "
+        f"capacity {event['capacity']}"
+    )
     if rows:
         fields = event.get("registration_fields") or []
         export_rows = [flatten_registration(row, fields) for row in rows]

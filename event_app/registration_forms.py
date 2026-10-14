@@ -174,11 +174,26 @@ def validate_registration_answers(
 
 
 def flatten_registration(row: dict[str, Any], fields: list[dict[str, Any]]) -> dict[str, Any]:
+    team_members = row.get("team_members") or []
     flattened = {
         "Student name": row.get("student_name"),
         "Student ID": row.get("student_id"),
         "Email": row.get("email"),
         "Phone": row.get("phone"),
+        "Team size": int(row.get("team_size") or 1),
+        "Team members": "; ".join(
+            " · ".join(
+                value
+                for value in (
+                    str(member.get("name") or "").strip(),
+                    f"ID {member.get('student_id')}" if member.get("student_id") else "",
+                    str(member.get("email") or "").strip(),
+                    str(member.get("phone") or "").strip(),
+                )
+                if value
+            )
+            for member in team_members
+        ),
         "Registered at": row.get("created_at"),
     }
     answers = row.get("form_answers") or {}

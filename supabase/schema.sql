@@ -8,6 +8,8 @@ create table if not exists public.events (
     starts_at timestamptz not null,
     venue text not null check (char_length(venue) between 1 and 200),
     capacity integer not null check (capacity > 0),
+    allow_team_registration boolean not null default false,
+    max_team_size integer not null default 4 check (max_team_size between 2 and 20),
     registration_fields jsonb not null default '[]'::jsonb
         check (jsonb_typeof(registration_fields) = 'array'),
     coordinators jsonb not null default '[]'::jsonb
@@ -20,6 +22,11 @@ alter table public.events
     add column if not exists registration_fields jsonb not null default '[]'::jsonb;
 alter table public.events
     add column if not exists coordinators jsonb not null default '[]'::jsonb;
+alter table public.events
+    add column if not exists allow_team_registration boolean not null default false;
+alter table public.events
+    add column if not exists max_team_size integer not null default 4
+        check (max_team_size between 2 and 20);
 
 create or replace function public.set_event_updated_at()
 returns trigger
@@ -47,6 +54,9 @@ create table if not exists public.registrations (
     phone text,
     form_answers jsonb not null default '{}'::jsonb
         check (jsonb_typeof(form_answers) = 'object'),
+    team_size integer not null default 1 check (team_size between 1 and 20),
+    team_members jsonb not null default '[]'::jsonb
+        check (jsonb_typeof(team_members) = 'array'),
     created_at timestamptz not null default now(),
     constraint unique_event_student unique (event_id, student_id)
 );
@@ -54,6 +64,12 @@ alter table public.registrations
     add column if not exists form_answers jsonb not null default '{}'::jsonb;
 alter table public.registrations
     add column if not exists user_id uuid references auth.users(id) on delete cascade;
+alter table public.registrations
+    add column if not exists team_size integer not null default 1
+        check (team_size between 1 and 20);
+alter table public.registrations
+    add column if not exists team_members jsonb not null default '[]'::jsonb
+        check (jsonb_typeof(team_members) = 'array');
 create unique index if not exists unique_event_user
     on public.registrations(event_id, user_id)
     where user_id is not null;
@@ -138,7 +154,7 @@ for each row execute function public.set_conversation_updated_at();
 
 -- Counts are exposed to the server-side app using its service-role key.
 create or replace view public.event_registration_counts as
-select e.id as event_id, count(r.id)::integer as registration_count
+select e.id as event_id, coalesce(sum(r.team_size), 0)::integer as registration_count
 from public.events e
 left join public.registrations r on r.event_id = e.id
 group by e.id;
@@ -154,10 +170,12 @@ as $$
 declare
     event_capacity integer;
     event_is_published boolean;
+    teams_allowed boolean;
+    event_max_team_size integer;
     current_registrations integer;
 begin
-    select e.capacity, e.published
-      into event_capacity, event_is_published
+    select e.capacity, e.published, e.allow_team_registration, e.max_team_size
+      into event_capacity, event_is_published, teams_allowed, event_max_team_size
       from public.events e
      where e.id = new.event_id
       for no key update;
@@ -166,11 +184,71 @@ begin
         raise exception 'event_not_open' using errcode = 'P0001';
     end if;
 
-    select count(*) into current_registrations
+    if new.team_size > 1 and not teams_allowed then
+        raise exception 'event_teams_not_allowed' using errcode = 'P0001';
+    end if;
+    if new.team_size > event_max_team_size
+       or jsonb_array_length(new.team_members) <> new.team_size - 1 then
+        raise exception 'invalid_team_registration' using errcode = 'P0001';
+    end if;
+
+    if exists (
+        select 1
+          from jsonb_array_elements(new.team_members) as member(value)
+         where char_length(trim(coalesce(member.value->>'name', ''))) not between 2 and 100
+            or char_length(trim(coalesce(member.value->>'student_id', ''))) not between 2 and 50
+            or char_length(trim(coalesce(member.value->>'email', ''))) not between 3 and 254
+            or trim(coalesce(member.value->>'email', '')) !~ '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'
+    ) then
+        raise exception 'invalid_team_registration' using errcode = 'P0001';
+    end if;
+
+    if exists (
+        select 1
+          from jsonb_array_elements(new.team_members) as member(value)
+         group by lower(trim(member.value->>'student_id'))
+        having count(*) > 1
+    ) or exists (
+        select 1
+          from jsonb_array_elements(new.team_members) as member(value)
+         where lower(trim(member.value->>'student_id')) = lower(trim(new.student_id))
+    ) then
+        raise exception 'duplicate_team_student_id' using errcode = 'P0001';
+    end if;
+
+    if exists (
+        select 1
+          from public.registrations r
+         where r.event_id = new.event_id
+           and exists (
+               select 1
+                 from jsonb_array_elements(new.team_members) as new_member(value)
+                where lower(trim(new_member.value->>'student_id')) = lower(trim(r.student_id))
+                   or exists (
+                       select 1
+                         from jsonb_array_elements(r.team_members) as old_member(value)
+                        where lower(trim(old_member.value->>'student_id')) =
+                              lower(trim(new_member.value->>'student_id'))
+                   )
+           )
+    ) or exists (
+        select 1
+          from public.registrations r
+         where r.event_id = new.event_id
+           and exists (
+               select 1
+                 from jsonb_array_elements(r.team_members) as old_member(value)
+                where lower(trim(old_member.value->>'student_id')) = lower(trim(new.student_id))
+           )
+    ) then
+        raise exception 'duplicate_team_student_id' using errcode = 'P0001';
+    end if;
+
+    select coalesce(sum(r.team_size), 0) into current_registrations
       from public.registrations r
      where r.event_id = new.event_id;
 
-    if current_registrations >= event_capacity then
+    if current_registrations + new.team_size > event_capacity then
         raise exception 'event_registration_full' using errcode = 'P0001';
     end if;
     return new;
@@ -192,7 +270,7 @@ declare
     current_registrations integer;
 begin
     if new.capacity < old.capacity then
-        select count(*) into current_registrations
+        select coalesce(sum(r.team_size), 0) into current_registrations
           from public.registrations r
          where r.event_id = old.id;
         if new.capacity < current_registrations then
