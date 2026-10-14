@@ -1,6 +1,5 @@
 """Student-friendly event discovery and registration, backed by Supabase."""
 
-import hmac
 from datetime import datetime, time, timezone
 from typing import Any, Optional
 from uuid import uuid4
@@ -10,7 +9,15 @@ import streamlit as st
 from supabase import Client, create_client
 from streamlit.errors import StreamlitSecretNotFoundError
 
+from event_app.admin_auth import admin_configuration_error, authenticate_admin
 from event_app.exports import registrations_csv
+from event_app.student_auth import (
+    clear_student_session,
+    current_student,
+    persist_auth_session,
+    sign_in_student,
+    sign_up_student,
+)
 from event_app.supabase_data import (
     create_registration,
     delete_photo_record,
@@ -71,6 +78,17 @@ def get_supabase_client() -> Client:
     return create_client(url, key)
 
 
+def get_auth_client() -> Client:
+    url = secret_value("SUPABASE_URL")
+    key = secret_value("SUPABASE_PUBLISHABLE_KEY")
+    if not url or not key:
+        raise RuntimeError(
+            "Student accounts are not configured. Add SUPABASE_URL and "
+            "SUPABASE_PUBLISHABLE_KEY to Streamlit secrets."
+        )
+    return create_client(url, key)
+
+
 def configured_timezone() -> ZoneInfo:
     timezone_name = secret_value("APP_TIMEZONE", "UTC")
     try:
@@ -89,6 +107,7 @@ def error_message(error: Exception) -> str:
     if (
         "duplicate key" in detail
         or "unique_event_student" in detail
+        or "unique_event_user" in detail
         or "registrations_event_id_student_id_key" in detail
     ):
         return "You're already registered for this event with that student ID."
@@ -120,36 +139,56 @@ def show_event_card(event: dict[str, Any], count: int) -> None:
                 st.session_state["selected_event_id"] = event["id"]
 
 
-def show_registration_form(client: Client, event: dict[str, Any], count: int) -> None:
+def show_registration_form(
+    client: Client,
+    event: dict[str, Any],
+    count: int,
+    student_user: Optional[Any],
+) -> None:
     capacity = int(event["capacity"])
     if count >= capacity:
         st.warning("This event is full and registration is closed.")
         return
+    if student_user is None:
+        st.info("Create a student account or sign in to register for this event.")
+        return
+
+    metadata = student_user.user_metadata or {}
+    student, errors = validate_registration(
+        metadata.get("student_name", ""),
+        metadata.get("student_id", ""),
+        student_user.email or "",
+        metadata.get("phone", ""),
+    )
+    if errors or student is None:
+        st.error("Your student account profile is incomplete. Please contact an administrator.")
+        return
+
+    st.caption(f"Registering as **{student['student_name']}** · {student['student_id']} · {student['email']}")
+    if student.get("phone"):
+        st.caption(f"Phone: {student['phone']}")
     st.markdown("#### Save your spot")
-    with st.form(f"register-{event['id']}"):
-        name = st.text_input("Full name", max_chars=100, placeholder="Jordan Lee")
-        student_id = st.text_input("Student ID", max_chars=50, placeholder="e.g. STU-20481")
-        email = st.text_input("Email address", max_chars=254, placeholder="you@university.edu")
-        phone = st.text_input("Phone number (optional)", max_chars=30)
-        submitted = st.form_submit_button("Register for this event", type="primary", use_container_width=True)
+    with st.form(f"register-{event['id']}-{student_user.id}"):
+        submitted = st.form_submit_button(
+            "Register for this event",
+            type="primary",
+            use_container_width=True,
+        )
     if submitted:
-        student, errors = validate_registration(name, student_id, email, phone)
-        if errors:
-            for message in errors:
-                st.error(message)
-            return
-        if student is None:
-            st.error("Please re-enter your registration details.")
-            return
         try:
-            create_registration(client, event["id"], student)
+            create_registration(client, event["id"], student, student_user.id)
             st.success("You're in! Your registration has been saved.")
             st.rerun()
         except Exception as error:
             st.error(error_message(error))
 
 
-def show_event_detail(client: Client, event: dict[str, Any], count: int) -> None:
+def show_event_detail(
+    client: Client,
+    event: dict[str, Any],
+    count: int,
+    student_user: Optional[Any],
+) -> None:
     st.markdown("---")
     if st.button("← Back to all events", key="back-to-events"):
         st.session_state.pop("selected_event_id", None)
@@ -171,10 +210,10 @@ def show_event_detail(client: Client, event: dict[str, Any], count: int) -> None
                 st.image([photo["public_url"] for photo in photos], use_container_width=True)
         with right:
             st.metric("Spots remaining", max(int(event["capacity"]) - count, 0))
-            show_registration_form(client, event, count)
+            show_registration_form(client, event, count, student_user)
 
 
-def show_public_view(client: Client) -> None:
+def show_public_view(client: Client, student_user: Optional[Any]) -> None:
     st.markdown(
         """
         <div class="hero">
@@ -207,36 +246,134 @@ def show_public_view(client: Client) -> None:
     if selected_id:
         event = next((item for item in upcoming if item["id"] == selected_id), None)
         if event:
-            show_event_detail(client, event, counts.get(event["id"], 0))
+            show_event_detail(client, event, counts.get(event["id"], 0), student_user)
+
+
+def show_student_account(auth_client: Client, student_user: Optional[Any]) -> None:
+    st.markdown("### Student account")
+    if student_user:
+        metadata = student_user.user_metadata or {}
+        st.success(f"Signed in as {metadata.get('student_name', student_user.email)}")
+        if st.button("Sign out of student account", key="student-sign-out"):
+            try:
+                auth_client.auth.sign_out()
+            finally:
+                clear_student_session(st.session_state)
+            st.rerun()
+        return
+
+    if st.session_state.pop("student_auth_error", False):
+        st.warning("Your student session couldn't be verified. Please sign in again.")
+    sign_in_tab, create_account_tab = st.tabs(["Sign in", "Create account"])
+    with sign_in_tab:
+        with st.form("student-sign-in"):
+            email = st.text_input("Email", key="student-login-email")
+            password = st.text_input("Password", type="password", key="student-login-password")
+            submitted = st.form_submit_button("Sign in", type="primary")
+        if submitted:
+            try:
+                response = sign_in_student(auth_client, email.strip().lower(), password)
+                if not response.session:
+                    st.error("Sign-in didn't return an active session. Confirm your email, then try again.")
+                    return
+                persist_auth_session(response.session, st.session_state)
+                st.success("Signed in. You can now register for events.")
+                st.rerun()
+            except Exception:
+                st.error("We couldn't sign you in. Check your email and password, then try again.")
+
+    with create_account_tab:
+        st.caption("Use one account to register for campus events. You can still browse events without signing in.")
+        with st.form("student-create-account"):
+            name = st.text_input("Full name", max_chars=100, key="student-signup-name")
+            student_id = st.text_input("Student ID", max_chars=50, key="student-signup-id")
+            email = st.text_input("Email", max_chars=254, key="student-signup-email")
+            phone = st.text_input("Phone number (optional)", max_chars=30, key="student-signup-phone")
+            password = st.text_input(
+                "Password (at least 10 characters)",
+                type="password",
+                key="student-signup-password",
+            )
+            confirm_password = st.text_input(
+                "Confirm password",
+                type="password",
+                key="student-signup-confirm-password",
+            )
+            submitted = st.form_submit_button("Create student account", type="primary")
+        if submitted:
+            profile, errors = validate_registration(name, student_id, email, phone)
+            if errors:
+                for message in errors:
+                    st.error(message)
+            elif len(password) < 10:
+                st.error("Choose a password with at least 10 characters.")
+            elif password != confirm_password:
+                st.error("The passwords don't match.")
+            elif profile is None:
+                st.error("Please check your student account details.")
+            else:
+                try:
+                    response = sign_up_student(
+                        auth_client,
+                        profile["email"] or "",
+                        password,
+                        profile["student_name"],
+                        profile["student_id"],
+                        profile["phone"],
+                    )
+                    if response.session:
+                        persist_auth_session(response.session, st.session_state)
+                        st.success("Your account is ready. You can now register for events.")
+                        st.rerun()
+                    else:
+                        st.success(
+                            "Account created. Check your email for the confirmation link, "
+                            "then sign in here."
+                        )
+                except Exception:
+                    st.error(
+                        "We couldn't create that account. Check the details; if this email "
+                        "is already registered, sign in instead."
+                    )
 
 
 def is_admin_authenticated() -> bool:
-    configured_password = secret_value("ADMIN_PASSWORD")
-    if not configured_password:
-        st.error("Admin access is disabled. Configure ADMIN_PASSWORD in Streamlit secrets.")
+    try:
+        configured_admins = st.secrets.get("ADMIN_USERS", {})
+    except StreamlitSecretNotFoundError:
+        configured_admins = {}
+    configuration_error = admin_configuration_error(configured_admins)
+    if configuration_error:
+        st.error(f"Admin access is disabled. {configuration_error}")
         return False
-    return bool(st.session_state.get("is_admin", False))
+    return bool(st.session_state.get("admin_email"))
 
 
 def show_admin_login() -> bool:
     if is_admin_authenticated():
         top_left, top_right = st.columns([5, 1])
+        with top_left:
+            st.caption(f"Signed in as {st.session_state['admin_email']}")
         with top_right:
             if st.button("Sign out", key="admin-sign-out"):
-                st.session_state["is_admin"] = False
+                st.session_state.pop("admin_email", None)
                 st.rerun()
         return True
 
-    st.markdown("Sign in with your event administrator password to manage campus events.")
+    st.markdown("Sign in with your administrator email and password to manage campus events.")
     with st.form("admin-login"):
+        email = st.text_input("Admin email")
         password = st.text_input("Admin password", type="password")
         submitted = st.form_submit_button("Sign in", type="primary")
     if submitted:
-        configured_password = secret_value("ADMIN_PASSWORD")
-        if configured_password and hmac.compare_digest(password, configured_password):
-            st.session_state["is_admin"] = True
+        try:
+            configured_admins = st.secrets.get("ADMIN_USERS", {})
+        except StreamlitSecretNotFoundError:
+            configured_admins = {}
+        if authenticate_admin(configured_admins, email, password):
+            st.session_state["admin_email"] = email.strip().lower()
             st.rerun()
-        st.error("That password didn't match. Please try again.")
+        st.error("That email and password didn't match an administrator account.")
     return False
 
 
@@ -420,15 +557,21 @@ def main() -> None:
     )
     try:
         client = get_supabase_client()
+        auth_client = get_auth_client()
         configured_timezone()
     except Exception as error:
         st.error(str(error))
         st.info("Set up your Supabase project by following the instructions in README.md.")
         return
 
-    student_tab, admin_tab = st.tabs(["Discover events", "Admin"])
-    with student_tab:
-        show_public_view(client)
+    student_user = current_student(auth_client, st.session_state)
+    events_tab, account_tab, admin_tab = st.tabs(
+        ["Discover events", "Student account", "Admin"]
+    )
+    with events_tab:
+        show_public_view(client, student_user)
+    with account_tab:
+        show_student_account(auth_client, student_user)
     with admin_tab:
         show_admin_view(client)
 

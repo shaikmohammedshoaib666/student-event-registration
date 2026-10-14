@@ -34,3 +34,10 @@ def test_invalid_registration_details_are_rejected(name, student_id, email, phon
 
     assert student is None
     assert errors
+
+
+def test_invalid_student_email_is_rejected():
+    student, errors = validate_registration("Ada Lovelace", "STU-20481", "ada-at-example.com")
+
+    assert student is None
+    assert errors == ["Enter a valid email address."]

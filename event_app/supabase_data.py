@@ -46,8 +46,11 @@ def create_registration(
     client: Any,
     event_id: str,
     student: dict[str, Optional[str]],
+    user_id: str,
 ) -> None:
-    client.table("registrations").insert({"event_id": event_id, **student}).execute()
+    client.table("registrations").insert(
+        {"event_id": event_id, "user_id": user_id, **student}
+    ).execute()
 
 
 def list_registrations(client: Any, event_id: str) -> list[dict[str, Any]]:

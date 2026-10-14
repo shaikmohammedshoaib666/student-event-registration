@@ -32,6 +32,7 @@ for each row execute function public.set_event_updated_at();
 create table if not exists public.registrations (
     id uuid primary key default gen_random_uuid(),
     event_id uuid not null references public.events(id) on delete cascade,
+    user_id uuid references auth.users(id) on delete cascade,
     student_name text not null check (char_length(student_name) between 2 and 100),
     student_id text not null check (char_length(student_id) between 2 and 50),
     email text not null check (char_length(email) between 3 and 254),
@@ -39,6 +40,11 @@ create table if not exists public.registrations (
     created_at timestamptz not null default now(),
     constraint unique_event_student unique (event_id, student_id)
 );
+alter table public.registrations
+    add column if not exists user_id uuid references auth.users(id) on delete cascade;
+create unique index if not exists unique_event_user
+    on public.registrations(event_id, user_id)
+    where user_id is not null;
 create index if not exists registrations_event_id_idx on public.registrations(event_id);
 
 create table if not exists public.event_photos (
