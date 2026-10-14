@@ -1,0 +1,1 @@
+"""Student event registration application."""
