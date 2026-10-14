@@ -4,6 +4,8 @@ from pathlib import Path
 import supabase
 from streamlit.testing.v1 import AppTest
 
+from event_app import chat
+
 
 class FakeResult:
     def __init__(self, data):
@@ -378,6 +380,124 @@ def test_student_account_lists_enrollments_and_coordinator_chat(monkeypatch):
         link.label == "WhatsApp Jordan Coordinator"
         for link in app.get("link_button")
     )
+
+
+def test_student_account_view_event_button_navigates_without_widget_error(monkeypatch):
+    event = {
+        "id": "event-1",
+        "title": "Campus welcome",
+        "description": "Welcome to campus",
+        "starts_at": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
+        "venue": "Main Hall",
+        "capacity": 40,
+        "published": True,
+        "coordinators": [],
+    }
+    registrations = [
+        {
+            "event_id": "event-1",
+            "user_id": "student-1",
+            "student_name": "Test Student",
+            "student_id": "STU-123",
+            "email": "student@example.edu",
+            "created_at": "2026-10-14T12:00:00Z",
+            "team_size": 1,
+            "team_members": [],
+            "events": event,
+        }
+    ]
+    monkeypatch.setattr(
+        supabase,
+        "create_client",
+        lambda *_args, **_kwargs: FakeClient(event, registrations),
+    )
+    app = AppTest.from_file(
+        str(Path(__file__).resolve().parents[1] / "app.py"),
+        default_timeout=20,
+    )
+    app.secrets.update(
+        {
+            "SUPABASE_URL": "https://example.supabase.co",
+            "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_test",
+            "SUPABASE_SERVICE_ROLE_KEY": "sb_secret_test",
+        }
+    )
+    app.session_state["app_section"] = "Student account"
+    app.session_state["student_access_token"] = "test-access-token"
+    app.session_state["student_refresh_token"] = "test-refresh-token"
+    app.run()
+
+    next(button for button in app.button if button.label == "View event").click()
+    app.run()
+
+    assert not app.exception
+    assert app.radio[0].value == "Events"
+    assert any("Campus welcome" in item.value for item in app.markdown)
+
+
+def test_student_account_chat_button_navigates_to_messages_without_widget_error(
+    monkeypatch,
+):
+    event = {
+        "id": "event-1",
+        "title": "Campus welcome",
+        "starts_at": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
+        "venue": "Main Hall",
+        "capacity": 40,
+        "published": True,
+        "coordinators": [
+            {
+                "name": "Jordan Coordinator",
+                "email": "coordinator@example.edu",
+                "phone": "",
+            }
+        ],
+    }
+    registrations = [
+        {
+            "event_id": "event-1",
+            "user_id": "student-1",
+            "student_name": "Test Student",
+            "student_id": "STU-123",
+            "email": "student@example.edu",
+            "created_at": "2026-10-14T12:00:00Z",
+            "team_size": 1,
+            "team_members": [],
+            "events": event,
+        }
+    ]
+    monkeypatch.setattr(
+        supabase,
+        "create_client",
+        lambda *_args, **_kwargs: FakeClient(event, registrations),
+    )
+    monkeypatch.setattr(
+        chat,
+        "get_or_create_conversation",
+        lambda *_args, **_kwargs: {"id": "conversation-1"},
+    )
+    app = AppTest.from_file(
+        str(Path(__file__).resolve().parents[1] / "app.py"),
+        default_timeout=20,
+    )
+    app.secrets.update(
+        {
+            "SUPABASE_URL": "https://example.supabase.co",
+            "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_test",
+            "SUPABASE_SERVICE_ROLE_KEY": "sb_secret_test",
+        }
+    )
+    app.session_state["app_section"] = "Student account"
+    app.session_state["student_access_token"] = "test-access-token"
+    app.session_state["student_refresh_token"] = "test-refresh-token"
+    app.run()
+
+    next(button for button in app.button if button.label == "In-app chat").click()
+    app.run()
+
+    assert not app.exception
+    assert app.radio[0].value == "Messages"
+    assert any(item.value == "Coordinator messages" for item in app.title)
 
 
 def test_assigned_coordinator_sees_only_scoped_workspace_on_messages(monkeypatch):

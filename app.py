@@ -101,6 +101,25 @@ def secret_value(name: str, default: str = "") -> str:
         return default
 
 
+APP_SECTIONS = (
+    "Events",
+    "Student account",
+    "Messages",
+    "Admin login / dashboard",
+)
+
+
+def request_navigation(section: str) -> None:
+    st.session_state["pending_app_section"] = section
+    st.rerun()
+
+
+def apply_pending_navigation() -> None:
+    section = st.session_state.pop("pending_app_section", None)
+    if section in APP_SECTIONS:
+        st.session_state["app_section"] = section
+
+
 def get_supabase_client() -> Client:
     url = secret_value("SUPABASE_URL")
     key = secret_value("SUPABASE_SERVICE_ROLE_KEY")
@@ -376,8 +395,7 @@ def show_event_detail(
                                 (student_user.user_metadata or {}).get("student_id", ""),
                             )
                             st.session_state["selected_conversation_id"] = thread["id"]
-                            st.session_state["app_section"] = "Messages"
-                            st.rerun()
+                            request_navigation("Messages")
                     else:
                         contact_cols[3].caption("Sign in to message in the app")
                 elif student_user:
@@ -551,8 +569,7 @@ def show_student_account(
                                     metadata.get("student_id", ""),
                                 )
                                 st.session_state["selected_conversation_id"] = thread["id"]
-                                st.session_state["app_section"] = "Messages"
-                                st.rerun()
+                                request_navigation("Messages")
                             except Exception as error:
                                 st.error(
                                     "Couldn't open coordinator chat. "
@@ -568,8 +585,7 @@ def show_student_account(
                     key=f"account-event-{registration['event_id']}",
                 ):
                     st.session_state["selected_event_id"] = registration["event_id"]
-                    st.session_state["app_section"] = "Events"
-                    st.rerun()
+                    request_navigation("Events")
         if st.button("Sign out of student account", key="student-sign-out"):
             try:
                 auth_client.auth.sign_out()
@@ -1223,6 +1239,7 @@ def show_admin_view(client: Client) -> None:
 
 
 def main() -> None:
+    apply_pending_navigation()
     st.markdown(
         '<div class="hero"><div class="eyebrow">CAMPUS CONNECT</div></div>',
         unsafe_allow_html=True,
@@ -1248,7 +1265,7 @@ def main() -> None:
         st.sidebar.info("Browse events as a guest. Sign in to register and chat.")
     section = st.sidebar.radio(
         "Go to",
-        ["Events", "Student account", "Messages", "Admin login / dashboard"],
+        list(APP_SECTIONS),
         key="app_section",
     )
     st.sidebar.markdown("---")
