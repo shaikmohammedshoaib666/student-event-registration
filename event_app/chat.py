@@ -1,6 +1,16 @@
 """Persisted event chat access helpers."""
 
-from typing import Any
+from uuid import uuid4
+from typing import Any, Optional
+
+
+CHAT_BUCKET = "chat-attachments"
+CHAT_IMAGE_TYPES = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+}
+CHAT_IMAGE_MAX_BYTES = 5 * 1024 * 1024
 
 
 def get_or_create_conversation(
@@ -10,6 +20,7 @@ def get_or_create_conversation(
     student_email: str,
     student_name: str,
     coordinator_email: str,
+    student_id: str = "",
 ) -> dict[str, Any]:
     query = (
         client.table("event_conversations")
@@ -27,6 +38,7 @@ def get_or_create_conversation(
             "student_user_id": student_user_id,
             "student_email": student_email.lower(),
             "student_name": student_name,
+            "student_id": student_id.strip(),
             "coordinator_email": coordinator_email.lower(),
         }
     ).execute().data or []
@@ -66,7 +78,7 @@ def list_conversations(client: Any, user_id: str, email: str) -> list[dict[str, 
 def list_messages(client: Any, conversation_id: str) -> list[dict[str, Any]]:
     return (
         client.table("event_messages")
-        .select("id,sender_user_id,sender_email,body,created_at")
+        .select("id,sender_user_id,sender_email,body,attachment_path,created_at")
         .eq("conversation_id", conversation_id)
         .order("created_at")
         .execute()
@@ -75,18 +87,55 @@ def list_messages(client: Any, conversation_id: str) -> list[dict[str, Any]]:
     )
 
 
+def upload_chat_image(
+    client: Any,
+    conversation_id: str,
+    sender_user_id: str,
+    uploaded: Any,
+) -> str:
+    mime_type = uploaded.type
+    extension = CHAT_IMAGE_TYPES.get(mime_type)
+    if extension is None:
+        raise ValueError("Chat attachments must be PNG, JPG, or WebP images.")
+    content = uploaded.getvalue()
+    if not content or len(content) > CHAT_IMAGE_MAX_BYTES:
+        raise ValueError("Chat photos must be non-empty and 5 MB or smaller.")
+
+    path = f"{conversation_id}/{sender_user_id}/{uuid4().hex}.{extension}"
+    client.storage.from_(CHAT_BUCKET).upload(
+        path,
+        content,
+        {"content-type": mime_type, "upsert": "false"},
+    )
+    return path
+
+
+def signed_chat_image_url(client: Any, path: str) -> str:
+    result = client.storage.from_(CHAT_BUCKET).create_signed_url(path, 3600)
+    signed_url = result.get("signedURL") or result.get("signedUrl")
+    if not signed_url:
+        raise RuntimeError("Supabase did not return a signed URL for this photo.")
+    return signed_url
+
+
 def send_message(
     client: Any,
     conversation_id: str,
     sender_user_id: str,
     sender_email: str,
     body: str,
+    *,
+    attachment_path: Optional[str] = None,
 ) -> None:
+    cleaned_body = body.strip()
+    if not cleaned_body and not attachment_path:
+        raise ValueError("A message must contain text or a photo.")
     client.table("event_messages").insert(
         {
             "conversation_id": conversation_id,
             "sender_user_id": sender_user_id,
             "sender_email": sender_email.lower(),
-            "body": body.strip(),
+            "body": cleaned_body,
+            "attachment_path": attachment_path,
         }
     ).execute()

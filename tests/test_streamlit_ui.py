@@ -193,10 +193,17 @@ def test_admin_dashboard_exposes_admin_login_route(monkeypatch):
     assert any(text.label == "Admin password" for text in app.text_input)
 
     app.session_state["admin_email"] = "admin@example.edu"
+    app.session_state["event-admin-task"] = "Manage events & photos"
     app.run()
 
     assert not app.exception
-    assert len(app.dataframe) == 4
+    assert any(
+        uploader.label == "Choose event photos" for uploader in app.get("file_uploader")
+    )
+    assert any(button.label == "Upload photos" for button in app.button)
+    assert any(
+        "Event coordinators" in item.value for item in app.markdown
+    )
     assert any(
         "Event coordinators" in item.value for item in app.markdown
     )

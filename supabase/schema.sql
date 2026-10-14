@@ -74,6 +74,7 @@ create table if not exists public.event_conversations (
     student_user_id uuid not null references auth.users(id) on delete cascade,
     student_email text not null,
     student_name text not null,
+    student_id text not null default '',
     coordinator_email text not null,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
@@ -82,6 +83,13 @@ create table if not exists public.event_conversations (
 );
 alter table public.event_conversations
     add column if not exists student_name text not null default 'Student';
+alter table public.event_conversations
+    add column if not exists student_id text not null default '';
+update public.event_conversations c
+   set student_id = coalesce(nullif(u.raw_user_meta_data->>'student_id', ''), '')
+  from auth.users u
+ where u.id = c.student_user_id
+   and c.student_id = '';
 create index if not exists event_conversations_coordinator_idx
     on public.event_conversations(coordinator_email, updated_at desc);
 
@@ -91,9 +99,22 @@ create table if not exists public.event_messages (
         references public.event_conversations(id) on delete cascade,
     sender_user_id uuid not null references auth.users(id) on delete cascade,
     sender_email text not null,
-    body text not null check (char_length(body) between 1 and 4000),
+    body text not null default '' check (char_length(body) between 0 and 4000),
+    attachment_path text,
     created_at timestamptz not null default now()
 );
+alter table public.event_messages
+    add column if not exists attachment_path text;
+alter table public.event_messages
+    drop constraint if exists event_messages_body_check;
+alter table public.event_messages
+    add constraint event_messages_body_check
+        check (char_length(body) between 0 and 4000);
+alter table public.event_messages
+    drop constraint if exists event_messages_body_or_image_check;
+alter table public.event_messages
+    add constraint event_messages_body_or_image_check
+        check (char_length(body) > 0 or attachment_path is not null);
 create index if not exists event_messages_conversation_idx
     on public.event_messages(conversation_id, created_at);
 
@@ -233,11 +254,27 @@ on conflict (id) do update set
     file_size_limit = excluded.file_size_limit,
     allowed_mime_types = excluded.allowed_mime_types;
 
+-- Chat photos are private; the app serves short-lived signed URLs after it
+-- verifies the viewer is a participant in the conversation.
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values (
+    'chat-attachments',
+    'chat-attachments',
+    false,
+    5242880,
+    array['image/jpeg', 'image/png', 'image/webp']
+)
+on conflict (id) do update set
+    public = excluded.public,
+    file_size_limit = excluded.file_size_limit,
+    allowed_mime_types = excluded.allowed_mime_types;
+
 -- Public URLs may read objects from this public bucket. Uploads/deletes are
 -- performed only by the app server using its service-role key.
 drop policy if exists "Public can read event photos" on storage.objects;
 create policy "Public can read event photos"
 on storage.objects for select to anon, authenticated
 using (bucket_id = 'event-photos');
+drop policy if exists "Public can read chat attachments" on storage.objects;
 
 notify pgrst, 'reload schema';

@@ -16,7 +16,9 @@ from event_app.chat import (
     get_or_create_conversation,
     list_conversations,
     list_messages,
+    signed_chat_image_url,
     send_message,
+    upload_chat_image,
 )
 from event_app.exports import registrations_csv
 from event_app.registration_forms import (
@@ -60,6 +62,17 @@ st.markdown(
     @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@600;700;800&display=swap');
     :root { --ink: #17243b; --muted: #68758a; --brand: #4b5ce2; --mint: #e8f5f0; }
     .stApp { background: #f7f8fc; color: var(--ink); font-family: 'DM Sans', sans-serif; }
+    .stApp, .stApp [data-testid="stMarkdownContainer"], .stApp label,
+    .stApp p, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5 {
+        color: var(--ink);
+    }
+    .stApp input, .stApp textarea, .stApp [data-baseweb="select"] > div,
+    .stApp [data-testid="stDateInput"] input, .stApp [data-testid="stTimeInput"] input {
+        background-color: #ffffff !important;
+        color: #17243b !important;
+        border-color: #cbd3e2 !important;
+    }
+    .stApp input::placeholder, .stApp textarea::placeholder { color: #68758a !important; }
     h1, h2, h3 { font-family: 'Manrope', sans-serif; letter-spacing: -0.035em; }
     .hero { padding: 2.5rem 0 1.3rem; }
     .eyebrow { color: var(--brand); font-size: .8rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
@@ -286,6 +299,7 @@ def show_event_detail(
                                     student_email,
                                 ),
                                 email,
+                                (student_user.user_metadata or {}).get("student_id", ""),
                             )
                             st.session_state["selected_conversation_id"] = thread["id"]
                             st.session_state["app_section"] = "Messages"
@@ -473,6 +487,9 @@ def show_messages(client: Client, student_user: Optional[Any]) -> None:
         )
         return
 
+    if st.button("Refresh messages", key="refresh-message-inbox"):
+        st.rerun()
+
     email = (student_user.email or "").strip().lower()
     try:
         threads = list_conversations(client, student_user.id, email)
@@ -495,7 +512,9 @@ def show_messages(client: Client, student_user: Optional[Any]) -> None:
             role = "Coordinator"
         else:
             other_person = (
-                f"{thread.get('student_name') or 'Student'} ({thread['student_email']})"
+                f"{thread.get('student_name') or 'Student'} · "
+                f"ID {thread.get('student_id') or 'not provided'} "
+                f"({thread['student_email']})"
             )
             role = "Student"
         labels[
@@ -522,7 +541,7 @@ def show_messages(client: Client, student_user: Optional[Any]) -> None:
     event = conversation.get("events") or {}
     st.caption(
         f"{event.get('title', 'Event')} · "
-        f"with {conversation['coordinator_email'] if conversation['student_user_id'] == student_user.id else (conversation.get('student_name') or 'Student') + ' (' + conversation['student_email'] + ')'}"
+        f"with {conversation['coordinator_email'] if conversation['student_user_id'] == student_user.id else (conversation.get('student_name') or 'Student') + ' · ID ' + (conversation.get('student_id') or 'not provided') + ' (' + conversation['student_email'] + ')'}"
     )
     try:
         messages = list_messages(client, conversation["id"])
@@ -536,27 +555,59 @@ def show_messages(client: Client, student_user: Optional[Any]) -> None:
             st.caption(
                 "You" if is_current_user else message.get("sender_email", "Participant")
             )
-            st.write(message["body"])
+            if message.get("body"):
+                st.write(message["body"])
+            if message.get("attachment_path"):
+                try:
+                    image_url = signed_chat_image_url(client, message["attachment_path"])
+                    st.image(image_url, caption="Photo attachment", width=420)
+                except Exception as error:
+                    st.warning(f"Couldn't load this photo. {backend_error_message(error)}")
             st.caption(message["created_at"])
 
     with st.form(f"send-message-{conversation['id']}", clear_on_submit=True):
         body = st.text_area("Message", max_chars=4000, height=90)
+        attachment = st.file_uploader(
+            "Attach a photo (optional, up to 5 MB)",
+            type=["png", "jpg", "jpeg", "webp"],
+            key=f"chat-photo-{conversation['id']}",
+        )
         send = st.form_submit_button("Send message", type="primary")
     if send:
         cleaned_body = body.strip()
-        if not cleaned_body:
-            st.warning("Write a message before sending.")
+        if not cleaned_body and attachment is None:
+            st.warning("Write a message or attach a photo before sending.")
             return
+        if attachment is not None and attachment.size > 5 * 1024 * 1024:
+            st.error("Chat photos must be 5 MB or smaller.")
+            return
+        attachment_path = None
         try:
+            if attachment is not None:
+                attachment_path = upload_chat_image(
+                    client,
+                    conversation["id"],
+                    student_user.id,
+                    attachment,
+                )
             send_message(
                 client,
                 conversation["id"],
                 student_user.id,
                 email,
                 cleaned_body,
+                attachment_path=attachment_path,
             )
             st.rerun()
         except Exception as error:
+            if attachment_path:
+                try:
+                    client.storage.from_("chat-attachments").remove([attachment_path])
+                except Exception as cleanup_error:
+                    st.warning(
+                        "The photo upload could not be cleaned up after the message failed. "
+                        f"{backend_error_message(cleanup_error)}"
+                    )
             st.error(f"Couldn't send this message. {backend_error_message(error)}")
 
 
@@ -725,55 +776,59 @@ def upload_event_photos(client: Client, event_id: str, files: list[Any]) -> None
 
 
 def show_event_admin(client: Client, events: list[dict[str, Any]]) -> None:
-    st.markdown("#### Create an event")
-    submitted, values, field_errors = event_form(key="create-event")
-    if submitted:
-        if field_errors:
-            for message in field_errors:
-                st.error(message)
-        elif not values["title"] or not values["description"] or not values["venue"]:
-            st.error("Add an event title, description, and venue before saving.")
-        else:
-            try:
-                saved = save_event(client, values)
-                st.success(f"Created “{saved['title']}”.")
-                st.rerun()
-            except Exception as error:
-                st.error(event_save_error(error))
+    event_task = st.radio(
+        "Event tasks",
+        ["Create event", "Manage events & photos"],
+        horizontal=True,
+        key="event-admin-task",
+    )
+    if event_task == "Create event":
+        st.markdown("#### Create an event")
+        submitted, values, field_errors = event_form(key="create-event")
+        if submitted:
+            if field_errors:
+                for message in field_errors:
+                    st.error(message)
+            elif not values["title"] or not values["description"] or not values["venue"]:
+                st.error("Add an event title, description, and venue before saving.")
+            else:
+                try:
+                    saved = save_event(client, values)
+                    st.success(
+                        f"Created “{saved['title']}”. Choose “Manage events & photos” "
+                        "to upload its event photos."
+                    )
+                    st.rerun()
+                except Exception as error:
+                    st.error(event_save_error(error))
+        return
 
     if not events:
+        st.info("Create and save an event first. Then choose it here to upload photos.")
         return
+
     st.markdown("---")
-    st.markdown("#### Update an event")
     labels = {f"{event['title']} · {event['id'][:8]}": event for event in events}
     selected_label = st.selectbox("Choose an event", options=list(labels))
     selected = labels[selected_label]
-    submitted, values, field_errors = event_form(
-        event=selected,
-        key=f"update-event-{selected['id']}",
-    )
-    if submitted:
-        if field_errors:
-            for message in field_errors:
-                st.error(message)
-        elif not values["title"] or not values["description"] or not values["venue"]:
-            st.error("Add an event title, description, and venue before saving.")
-        else:
-            try:
-                save_event(client, values, selected["id"])
-                st.success("Event updated.")
-                st.rerun()
-            except Exception as error:
-                st.error(event_save_error(error))
-
     st.markdown("#### Event photos")
+    st.caption(
+        "Upload PNG, JPG, or WebP images here. After upload, photos appear on the "
+        "student-facing event details."
+    )
     uploads = st.file_uploader(
-        "Upload event photos (PNG, JPG, or WebP)",
+        "Choose event photos",
         type=["png", "jpg", "jpeg", "webp"],
         accept_multiple_files=True,
         key=f"photos-{selected['id']}",
     )
-    if uploads and st.button("Upload photos", key=f"upload-{selected['id']}"):
+    upload_clicked = st.button(
+        "Upload photos",
+        key=f"upload-{selected['id']}",
+        type="primary",
+        disabled=not uploads,
+    )
+    if uploads and upload_clicked:
         try:
             upload_event_photos(client, selected["id"], uploads)
             st.success("Photos uploaded.")
@@ -799,6 +854,26 @@ def show_event_admin(client: Client, events: list[dict[str, Any]]) -> None:
                     st.rerun()
                 except Exception as error:
                     st.error(f"We couldn't remove that photo. {backend_error_message(error)}")
+
+    st.markdown("---")
+    st.markdown("#### Update event details")
+    submitted, values, field_errors = event_form(
+        event=selected,
+        key=f"update-event-{selected['id']}",
+    )
+    if submitted:
+        if field_errors:
+            for message in field_errors:
+                st.error(message)
+        elif not values["title"] or not values["description"] or not values["venue"]:
+            st.error("Add an event title, description, and venue before saving.")
+        else:
+            try:
+                save_event(client, values, selected["id"])
+                st.success("Event updated.")
+                st.rerun()
+            except Exception as error:
+                st.error(event_save_error(error))
 
 
 def show_registration_admin(client: Client, events: list[dict[str, Any]]) -> None:
