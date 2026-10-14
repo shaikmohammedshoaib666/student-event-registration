@@ -38,10 +38,12 @@ from event_app.student_auth import (
 )
 from event_app.supabase_data import (
     create_registration,
+    delete_event,
     delete_photo_record,
     list_events,
     list_photos,
     list_registrations,
+    list_student_registrations,
     registration_counts,
     save_event,
     save_photo_record,
@@ -457,11 +459,117 @@ def show_public_view(client: Client, student_user: Optional[Any]) -> None:
             )
 
 
-def show_student_account(auth_client: Client, student_user: Optional[Any]) -> None:
+def show_student_account(
+    auth_client: Client,
+    data_client: Client,
+    student_user: Optional[Any],
+) -> None:
     st.markdown("### Student account")
     if student_user:
         metadata = student_user.user_metadata or {}
         st.success(f"Signed in as {metadata.get('student_name', student_user.email)}")
+        st.markdown("#### My registrations")
+        try:
+            registrations = list_student_registrations(data_client, student_user.id)
+        except Exception as error:
+            st.error(
+                f"We couldn't load your event registrations. {backend_error_message(error)}"
+            )
+            registrations = []
+        if not registrations:
+            st.info(
+                "You haven't registered for an event yet. Browse Events, choose an "
+                "event, and register to see your enrollment here."
+            )
+        for registration in registrations:
+            event = registration.get("events") or {}
+            title = event.get("title", "Campus event")
+            team_size = int(registration.get("team_size") or 1)
+            starts_at = event.get("starts_at")
+            status = (
+                "Completed"
+                if starts_at
+                and datetime.fromisoformat(starts_at.replace("Z", "+00:00"))
+                < datetime.now(timezone.utc)
+                else "Enrolled"
+            )
+            with st.container(border=True):
+                st.markdown(f"#### {title}")
+                details = [f"**Status:** {status}"]
+                if starts_at:
+                    details.append(f"**When:** {format_datetime(starts_at)}")
+                if event.get("venue"):
+                    details.append(f"**Where:** {event['venue']}")
+                details.append(
+                    f"**Team:** {team_size} " + ("person" if team_size == 1 else "people")
+                )
+                st.markdown("  ·  ".join(details))
+                teammates = registration.get("team_members") or []
+                if teammates:
+                    st.caption(
+                        "Team members: "
+                        + ", ".join(
+                            f"{member.get('name')} ({member.get('student_id')})"
+                            for member in teammates
+                        )
+                    )
+                for index, coordinator in enumerate(event.get("coordinators") or []):
+                    coordinator_email = (
+                        str(coordinator.get("email") or "").strip().lower()
+                    )
+                    coordinator_phone = str(coordinator.get("phone") or "").strip()
+                    name = coordinator.get("name") or "Coordinator"
+                    st.markdown(f"**Coordinator: {name}**")
+                    contact_columns = st.columns(3)
+                    digits = "".join(
+                        character for character in coordinator_phone
+                        if character.isdigit()
+                    )
+                    if coordinator_phone and digits:
+                        contact_columns[0].link_button(
+                            f"Call {name}",
+                            f"tel:{coordinator_phone}",
+                        )
+                        contact_columns[1].link_button(
+                            f"WhatsApp {name}",
+                            f"https://wa.me/{digits}",
+                        )
+                    if coordinator_email:
+                        if contact_columns[2].button(
+                            "In-app chat",
+                            key=f"account-chat-{registration['event_id']}-{coordinator_email}",
+                            type="primary",
+                        ):
+                            try:
+                                thread = get_or_create_conversation(
+                                    data_client,
+                                    registration["event_id"],
+                                    student_user.id,
+                                    (student_user.email or "").strip().lower(),
+                                    metadata.get("student_name", student_user.email or ""),
+                                    coordinator_email,
+                                    metadata.get("student_id", ""),
+                                )
+                                st.session_state["selected_conversation_id"] = thread["id"]
+                                st.session_state["app_section"] = "Messages"
+                                st.rerun()
+                            except Exception as error:
+                                st.error(
+                                    "Couldn't open coordinator chat. "
+                                    + backend_error_message(error)
+                                )
+                    elif coordinator_phone:
+                        st.caption(
+                            "In-app chat is available when an admin assigns the "
+                            "coordinator's account email."
+                        )
+                if st.button(
+                    "View event",
+                    key=f"account-event-{registration['event_id']}",
+                ):
+                    st.session_state["selected_event_id"] = registration["event_id"]
+                    st.session_state["app_section"] = "Events"
+                    st.rerun()
         if st.button("Sign out of student account", key="student-sign-out"):
             try:
                 auth_client.auth.sign_out()
@@ -563,6 +671,7 @@ def show_messages(client: Client, student_user: Optional[Any]) -> None:
         st.rerun()
 
     email = (student_user.email or "").strip().lower()
+    show_coordinator_workspace(client, email)
     try:
         threads = list_conversations(client, student_user.id, email)
     except Exception as error:
@@ -681,6 +790,65 @@ def show_messages(client: Client, student_user: Optional[Any]) -> None:
                         f"{backend_error_message(cleanup_error)}"
                     )
             st.error(f"Couldn't send this message. {backend_error_message(error)}")
+
+
+def show_coordinator_workspace(client: Client, coordinator_email: str) -> None:
+    try:
+        events = list_events(client, published_only=False)
+    except Exception as error:
+        st.error(
+            f"Couldn't load the coordinator workspace. {backend_error_message(error)}"
+        )
+        return
+    assigned_events = [
+        event
+        for event in events
+        if any(
+            str(coordinator.get("email") or "").strip().lower() == coordinator_email
+            for coordinator in event.get("coordinators") or []
+        )
+    ]
+    if not assigned_events:
+        st.caption(
+            "No coordinator events are assigned to this account yet. Ask an admin "
+            "to assign this exact email to an event."
+        )
+        return
+
+    st.markdown("### Coordinator workspace")
+    st.caption(
+        "Your coordinator tools are limited to the events assigned to this account. "
+        "Student contact details are private; use them only to coordinate the event."
+    )
+    for event in assigned_events:
+        with st.expander(f"{event['title']} · {event['venue']}", expanded=True):
+            st.caption(format_datetime(event["starts_at"]))
+            try:
+                registrations = list_registrations(client, event["id"])
+            except Exception as error:
+                st.error(
+                    f"Couldn't load event registrations. {backend_error_message(error)}"
+                )
+                continue
+            reserved_spots = sum(
+                int(row.get("team_size") or 1) for row in registrations
+            )
+            st.caption(
+                f"{len(registrations)} registration(s) · {reserved_spots} of "
+                f"{event['capacity']} spots reserved"
+            )
+            if registrations:
+                fields = event.get("registration_fields") or []
+                st.dataframe(
+                    [flatten_registration(row, fields) for row in registrations],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.info(
+                    "No students have registered yet. Their chats will appear below "
+                    "after they contact you."
+                )
 
 
 def is_admin_authenticated() -> bool:
@@ -964,6 +1132,40 @@ def show_event_admin(client: Client, events: list[dict[str, Any]]) -> None:
             except Exception as error:
                 st.error(event_save_error(error))
 
+    st.markdown("---")
+    with st.expander("Delete event permanently"):
+        st.warning(
+            "This permanently deletes the event, its registrations and team rosters, "
+            "coordinator conversations, and stored event/chat photos. This cannot be undone."
+        )
+        confirm_delete = st.checkbox(
+            f"I understand that “{selected['title']}” and its data will be deleted.",
+            key=f"confirm-delete-event-{selected['id']}",
+        )
+        if st.button(
+            "Delete event permanently",
+            key=f"delete-event-{selected['id']}",
+            type="primary",
+            disabled=not confirm_delete,
+        ):
+            try:
+                delete_event(
+                    client,
+                    selected["id"],
+                    event_photo_bucket=secret_value(
+                        "SUPABASE_STORAGE_BUCKET",
+                        "event-photos",
+                    ),
+                )
+                st.session_state.pop("selected_event_id", None)
+                st.success("Event and its related data were deleted.")
+                st.rerun()
+            except Exception as error:
+                st.error(
+                    f"We couldn't completely delete this event. "
+                    f"{backend_error_message(error)}"
+                )
+
 
 def show_registration_admin(client: Client, events: list[dict[str, Any]]) -> None:
     st.markdown("#### Registrations")
@@ -1058,7 +1260,7 @@ def main() -> None:
     if section == "Events":
         show_public_view(client, student_user)
     elif section == "Student account":
-        show_student_account(auth_client, student_user)
+        show_student_account(auth_client, client, student_user)
     elif section == "Messages":
         show_messages(client, student_user)
     else:

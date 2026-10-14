@@ -11,17 +11,20 @@ class FakeResult:
 
 
 class FakeQuery:
-    def __init__(self, table, event):
+    def __init__(self, table, event, registrations):
         self.table = table
         self.event = event
+        self.registrations = registrations
+        self.filters = []
 
     def select(self, *_args):
         return self
 
-    def order(self, *_args):
+    def order(self, *_args, **_kwargs):
         return self
 
-    def eq(self, *_args):
+    def eq(self, column, value):
+        self.filters.append((column, value))
         return self
 
     def limit(self, *_args):
@@ -37,9 +40,16 @@ class FakeQuery:
             if not self.event:
                 return FakeResult([])
             return FakeResult([{"event_id": self.event["id"], "registration_count": 0}])
+        if self.table == "registrations":
+            rows = self.registrations
+            for column, value in self.filters:
+                if column == "user_id":
+                    rows = [row for row in rows if row.get("user_id") == value]
+                elif column == "event_id":
+                    rows = [row for row in rows if row.get("event_id") == value]
+            return FakeResult(rows)
         if self.table in (
             "event_photos",
-            "registrations",
             "event_conversations",
             "event_messages",
         ):
@@ -67,7 +77,7 @@ class FakeAuth:
 
 
 class FakeClient:
-    def __init__(self, event):
+    def __init__(self, event, registrations=None):
         self.auth = FakeAuth(
             type(
                 "User",
@@ -83,9 +93,10 @@ class FakeClient:
             )()
         )
         self.event = event
+        self.registrations = registrations or []
 
     def table(self, table):
-        return FakeQuery(table, self.event)
+        return FakeQuery(table, self.event, self.registrations)
 
 
 def test_student_and_admin_views_render_with_event_registration_form(monkeypatch):
@@ -224,6 +235,14 @@ def test_admin_dashboard_exposes_admin_login_route(monkeypatch):
         "Event coordinators" in item.value for item in app.markdown
     )
     assert any(
+        checkbox.label.startswith("I understand that")
+        for checkbox in app.checkbox
+    )
+    assert any(
+        button.label == "Delete event permanently" and button.disabled
+        for button in app.button
+    )
+    assert any(
         "Event coordinators" in item.value for item in app.markdown
     )
 
@@ -289,3 +308,130 @@ def test_message_section_explains_student_and_coordinator_account_login(monkeypa
 
     assert not app.exception
     assert any("Sign in or create a student account" in item.value for item in app.info)
+
+
+def test_student_account_lists_enrollments_and_coordinator_chat(monkeypatch):
+    event = {
+        "id": "event-1",
+        "title": "Campus welcome",
+        "starts_at": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
+        "venue": "Main Hall",
+        "capacity": 40,
+        "published": True,
+        "coordinators": [
+            {
+                "name": "Jordan Coordinator",
+                "email": "coordinator@example.edu",
+                "phone": "+15551234567",
+            }
+        ],
+    }
+    registrations = [
+        {
+            "event_id": "event-1",
+            "user_id": "student-1",
+            "student_name": "Test Student",
+            "student_id": "STU-123",
+            "email": "student@example.edu",
+            "created_at": "2026-10-14T12:00:00Z",
+            "team_size": 2,
+            "team_members": [
+                {
+                    "name": "Teammate",
+                    "student_id": "STU-456",
+                    "email": "teammate@example.edu",
+                }
+            ],
+            "events": event,
+        }
+    ]
+    monkeypatch.setattr(
+        supabase,
+        "create_client",
+        lambda *_args, **_kwargs: FakeClient(event, registrations),
+    )
+    app = AppTest.from_file(
+        str(Path(__file__).resolve().parents[1] / "app.py"),
+        default_timeout=20,
+    )
+    app.secrets.update(
+        {
+            "SUPABASE_URL": "https://example.supabase.co",
+            "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_test",
+            "SUPABASE_SERVICE_ROLE_KEY": "sb_secret_test",
+        }
+    )
+    app.session_state["app_section"] = "Student account"
+    app.session_state["student_access_token"] = "test-access-token"
+    app.session_state["student_refresh_token"] = "test-refresh-token"
+
+    app.run()
+
+    assert not app.exception
+    assert any("Campus welcome" in item.value for item in app.markdown)
+    assert any("Status:** Enrolled" in item.value for item in app.markdown)
+    assert any("Team:** 2 people" in item.value for item in app.markdown)
+    assert any("Teammate (STU-456)" in item.value for item in app.caption)
+    assert any(button.label == "In-app chat" for button in app.button)
+    assert any(link.label == "Call Jordan Coordinator" for link in app.get("link_button"))
+    assert any(
+        link.label == "WhatsApp Jordan Coordinator"
+        for link in app.get("link_button")
+    )
+
+
+def test_assigned_coordinator_sees_only_scoped_workspace_on_messages(monkeypatch):
+    event = {
+        "id": "event-1",
+        "title": "Campus welcome",
+        "description": "Welcome to campus",
+        "starts_at": (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(),
+        "venue": "Main Hall",
+        "capacity": 40,
+        "published": True,
+        "coordinators": [
+            {
+                "name": "Test Student",
+                "email": "student@example.edu",
+                "phone": "",
+            }
+        ],
+        "registration_fields": [],
+    }
+    registrations = [
+        {
+            "event_id": "event-1",
+            "student_name": "Registered Student",
+            "student_id": "STU-456",
+            "email": "registered@example.edu",
+            "created_at": "2026-10-14T12:00:00Z",
+            "team_size": 1,
+            "team_members": [],
+            "form_answers": {},
+        }
+    ]
+    monkeypatch.setattr(
+        supabase,
+        "create_client",
+        lambda *_args, **_kwargs: FakeClient(event, registrations),
+    )
+    app = AppTest.from_file(
+        str(Path(__file__).resolve().parents[1] / "app.py"),
+        default_timeout=20,
+    )
+    app.secrets.update(
+        {
+            "SUPABASE_URL": "https://example.supabase.co",
+            "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_test",
+            "SUPABASE_SERVICE_ROLE_KEY": "sb_secret_test",
+        }
+    )
+    app.session_state["app_section"] = "Messages"
+    app.session_state["student_access_token"] = "test-access-token"
+    app.session_state["student_refresh_token"] = "test-refresh-token"
+
+    app.run()
+
+    assert not app.exception
+    assert any("Coordinator workspace" in item.value for item in app.markdown)
+    assert any("Registered Student" in str(frame.value) for frame in app.dataframe)

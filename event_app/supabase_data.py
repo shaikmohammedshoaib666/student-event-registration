@@ -3,6 +3,8 @@
 from typing import Any
 from typing import Optional
 
+from event_app.chat import CHAT_BUCKET, list_messages
+
 
 def list_events(client: Any, *, published_only: bool = True) -> list[dict[str, Any]]:
     query = client.table("events").select("*").order("starts_at")
@@ -77,6 +79,55 @@ def list_registrations(client: Any, event_id: str) -> list[dict[str, Any]]:
         .data
         or []
     )
+
+
+def list_student_registrations(client: Any, user_id: str) -> list[dict[str, Any]]:
+    return (
+        client.table("registrations")
+        .select(
+            "event_id,student_name,student_id,email,phone,created_at,form_answers,"
+            "team_size,team_members,events(id,title,starts_at,venue,published,coordinators)"
+        )
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .execute()
+        .data
+        or []
+    )
+
+
+def delete_event(
+    client: Any,
+    event_id: str,
+    *,
+    event_photo_bucket: str = "event-photos",
+) -> None:
+    photos = list_photos(client, event_id)
+    conversations = (
+        client.table("event_conversations")
+        .select("id")
+        .eq("event_id", event_id)
+        .execute()
+        .data
+        or []
+    )
+    chat_attachment_paths = []
+    for conversation in conversations:
+        messages = list_messages(client, conversation["id"])
+        chat_attachment_paths.extend(
+            message["attachment_path"]
+            for message in messages
+            if message.get("attachment_path")
+        )
+
+    if photos:
+        client.storage.from_(event_photo_bucket).remove(
+            [photo["storage_path"] for photo in photos]
+        )
+    if chat_attachment_paths:
+        client.storage.from_(CHAT_BUCKET).remove(chat_attachment_paths)
+
+    client.table("events").delete().eq("id", event_id).execute()
 
 
 def save_photo_record(
