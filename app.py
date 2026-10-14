@@ -59,6 +59,10 @@ st.markdown(
     .hero p { color: var(--muted); font-size: 1.1rem; max-width: 690px; }
     [data-testid="stVerticalBlockBorderWrapper"] { background: white; border-radius: 18px; border-color: #e9ecf4; }
     [data-testid="stMetric"] { background: var(--mint); padding: .8rem 1rem; border-radius: 12px; }
+    .stTabs [data-baseweb="tab-list"] { gap: .5rem; border-bottom: 1px solid #d9deea; }
+    .stTabs [data-baseweb="tab"] { color: #35415a !important; font-weight: 700; }
+    .stTabs [data-baseweb="tab"][aria-selected="true"] { color: #4b5ce2 !important; }
+    .stTabs [data-baseweb="tab-highlight"] { background-color: #4b5ce2; }
     .tag { color: #3546c6; font-weight: 700; background: #eef0ff; padding: .3rem .65rem; border-radius: 99px; font-size: .82rem; }
     div.stButton > button[kind="primary"] { background: var(--brand); border-color: var(--brand); }
     @media (max-width: 640px) { .hero { padding-top: 1rem; } }
